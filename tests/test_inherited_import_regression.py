@@ -3,8 +3,14 @@ from textwrap import dedent
 
 import pytest
 
+from types_for_jinja.config import Config
 from types_for_jinja.header import parse_header
+from types_for_jinja.layout import layout
 from types_for_jinja.transpile import transpile
+
+from .backends import STUB_DIR
+from .checked import reported, write_template
+from .configuration import requires_checker
 
 
 @pytest.mark.parametrize(
@@ -50,21 +56,58 @@ def test_inherited_macro_import(
     assert expected in generated.code
 
 
-def test_child_assignment_visible_to_parent(tmp_path):
-    """Top-level `{% set %}`s should be visible to a parent template."""
+@pytest.mark.parametrize('set_first', [False, True])
+def test_child_assignment_visible_to_parent(tmp_path: Path, *, set_first: bool):
+    """Top-level `{% set %}`s should be visible to a parent template, on either side of extends."""
     (tmp_path / 'base.html').write_text('{{ page_title }}')
-
-    source = dedent(
-        """{#def
-        user_id: int
-        #}
-        {% extends "base.html" %}
-        {% set page_title = "Hello" %}
-        """
-    )
+    extends = '{% extends "base.html" %}'
+    assignment = '{% set page_title = "Hello" %}'
+    body = f'{assignment}\n{extends}' if set_first else f'{extends}\n{assignment}'
+    source = f'{{#def\nuser_id: int\n#}}\n{body}\n'
     header = parse_header(source)
     assert header is not None
 
     generated = transpile(source, header, template_path=tmp_path / 'child.html')
 
     assert generated.code.index('page_title = ') < generated.code.index('_ = page_title')
+    aligned = layout(generated, header, 'child_tj_shared')
+    assert aligned is not None
+    # The parent is checked from the sidecar, which has to keep the literal so the type is str.
+    assert aligned.sidecar.index("page_title = 'Hello'") < aligned.sidecar.index('_ = page_title')
+    assert 'page_title: _TJAny' not in aligned.sidecar
+    assignment_line = source.splitlines().index(assignment)
+    assert aligned.code.splitlines()[assignment_line] == "page_title = 'Hello'"
+
+
+@pytest.mark.parametrize('set_first', [False, True])
+@requires_checker('mypy')
+def test_parent_sees_the_assigned_type(project: Path, *, set_first: bool):
+    """A parent expression is checked against the inferred type, so a bad use is still an error."""
+    extends = '{% extends "base.html" %}'
+    assignment = '{% set page_title = "Hello" %}'
+    body = f'{assignment}\n{extends}' if set_first else f'{extends}\n{assignment}'
+    child = f'{{#def\nuser_id: int\n#}}\n{body}\n'
+    (project / 'templates' / 'base.html').write_text('{{ page_title + 1 }}\n', encoding='utf-8')
+    template = write_template('templates/child.html', child)
+
+    found = reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR), backend='mypy')
+
+    extends_line = child.splitlines().index(extends) + 1
+    assert found
+    assert all(entry.line == extends_line for entry in found)
+    assert any('str' in entry.message and 'int' in entry.message for entry in found)
+    assert not any(entry.mentions('not defined') for entry in found)
+
+
+@pytest.mark.parametrize('set_first', [False, True])
+@requires_checker('mypy')
+def test_parent_accepts_a_well_typed_child_assignment(project: Path, *, set_first: bool):
+    """A parent may read the assigned name once the child has given it a type."""
+    extends = '{% extends "base.html" %}'
+    assignment = '{% set page_title = "Hello" %}'
+    body = f'{assignment}\n{extends}' if set_first else f'{extends}\n{assignment}'
+    child = f'{{#def\nuser_id: int\n#}}\n{body}\n'
+    (project / 'templates' / 'base.html').write_text('{{ page_title }}\n', encoding='utf-8')
+    template = write_template('templates/child.html', child)
+
+    assert reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR), backend='mypy') == []
