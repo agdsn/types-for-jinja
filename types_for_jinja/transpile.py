@@ -105,7 +105,10 @@ def build_environment(syntax: Syntax, extensions: list[str] | None = None) -> En
 
 def deepest_line(node: nodes.Node) -> int:
     """The last line any part of ``node`` occupies; Jinja records no line for a closing tag."""
-    return max((child.lineno for child in node.find_all(nodes.Node)), default=node.lineno)
+    return max(
+        (child.lineno for child in node.find_all(nodes.Node) if child.lineno),
+        default=node.lineno,
+    )
 
 
 def _ident(name: str) -> str:
