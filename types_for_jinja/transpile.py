@@ -190,6 +190,13 @@ def transpile(
     _emit_body(split.render_nodes, body, 1, ctx)
     inherited: list[Line] = []
     _emit_body(split.base_nodes, inherited, 1, ctx)
+    # Jinja runs a child's top-level assignments before rendering the parent, on either side of
+    # `{% extends %}`. The parent is checked in the sidecar, which cannot see the child module, so
+    # the assignments are copied in front of it with their real right-hand sides. Stamping them
+    # with the extends line keeps that order under the stable line sort, and marking them foreign
+    # leaves the originals in the child so the aligned stub stays line-aligned.
+    if inherited:
+        body.extend(_exported_assignments(split.render_nodes, split.base_lineno))
     body.extend(_mark_foreign(inherited, split.base_lineno))
     body.extend(Line(1, use.call, use.lineno) for use in uses)
     body.sort(key=lambda line: line.lineno)
@@ -295,6 +302,20 @@ def _extension_globals(config: Config) -> list[str]:
 def _unique(items: list[str]) -> list[str]:
     """Drop repeats while keeping the first occurrence, so a shared import is emitted once."""
     return list(dict.fromkeys(items))
+
+
+def _exported_assignments(render_nodes: list[nodes.Node], lineno: int) -> list[Line]:
+    """Top-level ``{% set %}``s, as foreign lines the extended template is checked against.
+
+    Only assignments that are direct children of the template. A ``{% set %}`` inside a block or
+    loop is a different scope and does not reach the parent; one nested in ``{% if %}`` does, and
+    stays invisible here.
+    """
+    exported: list[Line] = []
+    for node in render_nodes:
+        if isinstance(node, nodes.Assign):
+            _emit_assign(node, exported, 1)
+    return _mark_foreign(exported, lineno)
 
 
 def _mark_foreign(lines: list[Line], lineno: int) -> list[Line]:
