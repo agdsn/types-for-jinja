@@ -532,6 +532,10 @@ def _load_base_nodes(
             _emit_macro(child, module_defs, base_ctx)
         elif isinstance(child, nodes.Extends):
             top_level.extend(_load_base_nodes(child, base_ctx, module_defs, imports))
+        elif isinstance(child, nodes.Import):
+            _emit_import(child, base_ctx, module_defs, imports)
+        elif isinstance(child, nodes.FromImport):
+            _emit_from_import(child, base_ctx, module_defs, imports)
         elif not isinstance(child, nodes.Block):
             top_level.append(child)
     return top_level
