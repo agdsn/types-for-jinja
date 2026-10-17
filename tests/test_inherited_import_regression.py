@@ -48,3 +48,23 @@ def test_inherited_macro_import(
     generated = transpile(source, header, template_path=child)
 
     assert expected in generated.code
+
+
+def test_child_assignment_visible_to_parent(tmp_path):
+    """Top-level `{% set %}`s should be visible to a parent template."""
+    (tmp_path / 'base.html').write_text('{{ page_title }}')
+
+    source = dedent(
+        """{#def
+        user_id: int
+        #}
+        {% extends "base.html" %}
+        {% set page_title = "Hello" %}
+        """
+    )
+    header = parse_header(source)
+    assert header is not None
+
+    generated = transpile(source, header, template_path=tmp_path / 'child.html')
+
+    assert generated.code.index('page_title = ') < generated.code.index('_ = page_title')
