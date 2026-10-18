@@ -11,7 +11,10 @@ that changes them still gets its headers read.
 from __future__ import annotations
 
 import ast
+import io
 import re
+import token
+import tokenize
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
@@ -130,7 +133,18 @@ def _parse_block(match: re.Match[str], source: str) -> TemplateHeader:
 
 
 _OPENS = frozenset('([{')
-_CLOSES = {')': '(', ']': '[', '}': '{'}
+_CLOSES = frozenset(')]}')
+_IGNORED_TOKENS = frozenset(
+    {
+        token.ENCODING,
+        token.ENDMARKER,
+        token.NEWLINE,
+        token.NL,
+        token.COMMENT,
+        token.INDENT,
+        token.DEDENT,
+    }
+)
 
 
 def _lift_caller(text: str) -> tuple[str, CallerClause | None, str | None]:
@@ -160,51 +174,53 @@ def _join(segments: list[str]) -> str:
 
 
 def _is_caller_clause(text: str) -> bool:
-    """A clause is ``caller`` followed by ``(``, not a parameter whose name is ``caller``."""
-    if not text.startswith('caller'):
-        return False
-    return text[len('caller') :].lstrip().startswith('(')
+    """A clause is a top-level ``caller`` name and ``(``, not a parameter named ``caller``."""
+    tokens = iter(_code_tokens(text))
+    name = next(tokens, None)
+    opened = next(tokens, None)
+    return (
+        name is not None
+        and opened is not None
+        and name.type == token.NAME
+        and name.string == 'caller'
+        and opened.type == token.OP
+        and opened.string == '('
+    )
 
 
 def _split_top_level(text: str) -> list[str]:
-    """Split on commas that sit outside parentheses, brackets, braces, and quotes."""
+    """Split on commas outside parentheses, brackets, and braces.
+
+    ``tokenize`` keeps a string, including its escapes, triple quotes, and f-string
+    pieces, as tokens. A comma inside a default is therefore not a separator.
+    """
     parts: list[str] = []
     start = 0
-    depth = dict.fromkeys(_OPENS, 0)
-    index = 0
-    while index < len(text):
-        nxt = _consume_quoted(text, index)
-        if nxt != index:
-            index = nxt
+    depth = 0
+    for tok in _code_tokens(text):
+        if tok.type != token.OP:
             continue
-        char = text[index]
-        if char in depth:
-            depth[char] += 1
-        elif char in _CLOSES and depth[_CLOSES[char]]:
-            depth[_CLOSES[char]] -= 1
-        elif char == ',' and not any(depth.values()):
-            parts.append(text[start:index])
-            start = index + 1
-        index += 1
+        if tok.string == ',' and depth == 0:
+            parts.append(text[start : tok.start[1]])
+            start = tok.end[1]
+        elif tok.string in _OPENS:
+            depth += 1
+        elif tok.string in _CLOSES and depth:
+            depth -= 1
     parts.append(text[start:])
     return parts
 
 
-def _consume_quoted(text: str, index: int) -> int:
-    """Return the index after a quote that starts at ``index``, or ``index`` when none does."""
-    quote = text[index]
-    if quote not in {'"', "'"}:
-        return index
-    token = quote * 3 if text.startswith(quote * 3, index) else quote
-    cursor = index + len(token)
-    while cursor < len(text):
-        if text.startswith(token, cursor):
-            return cursor + len(token)
-        if len(token) == 1 and text[cursor] == '\\':
-            cursor += 2
-            continue
-        cursor += 1
-    return len(text)
+def _code_tokens(text: str) -> list[tokenize.TokenInfo]:
+    """Tokens of ``text``. Tokens before an unclosed bracket are kept."""
+    found: list[tokenize.TokenInfo] = []
+    try:
+        found.extend(
+            tok for tok in tokenize.generate_tokens(io.StringIO(text).readline) if tok.type not in _IGNORED_TOKENS
+        )
+    except tokenize.TokenError:
+        return found
+    return found
 
 
 def _parse_caller(clause: str) -> tuple[CallerClause | None, str | None]:
@@ -220,41 +236,31 @@ def _parse_caller(clause: str) -> tuple[CallerClause | None, str | None]:
 
 
 def _split_clause(clause: str) -> tuple[str, str | None] | None:
-    rest = clause[len('caller') :].lstrip()
-    end = _matching_paren(rest)
-    if end is None:
+    tokens = _code_tokens(clause)
+    depth = 0
+    close: int | None = None
+    for index, tok in enumerate(tokens):
+        if tok.type != token.OP:
+            continue
+        if tok.string in _OPENS:
+            depth += 1
+        elif tok.string in _CLOSES and depth:
+            depth -= 1
+            if depth == 0 and tok.string == ')':
+                close = index
+                break
+    if close is None:
         return None
-    tail = rest[end + 1 :].strip()
+    inside = clause[tokens[1].end[1] : tokens[close].start[1]]
+    tail = tokens[close + 1 :]
     if not tail:
-        return rest[1:end], None
-    if not tail.startswith('->'):
+        return inside, None
+    if tail[0].type != token.OP or tail[0].string != '->' or len(tail) == 1:
         return None
-    returns = tail[2:].strip()
+    returns = clause[tail[1].start[1] : tail[-1].end[1]].strip()
     if not returns:
         return None
-    return rest[1:end], returns
-
-
-def _matching_paren(text: str) -> int | None:
-    """Index of the ``)`` that closes a ``(`` at the start of ``text``."""
-    if not text.startswith('('):
-        return None
-    depth = 0
-    index = 0
-    while index < len(text):
-        nxt = _consume_quoted(text, index)
-        if nxt != index:
-            index = nxt
-            continue
-        char = text[index]
-        if char == '(':
-            depth += 1
-        elif char == ')':
-            depth -= 1
-            if depth == 0:
-                return index
-        index += 1
-    return None
+    return inside, returns
 
 
 def _parse_params(text: str) -> tuple[list[Param], str | None]:
