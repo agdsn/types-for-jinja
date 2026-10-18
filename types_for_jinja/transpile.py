@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import keyword
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -565,14 +565,24 @@ def _caller_parameter(clause: CallerClause, *, optional: bool) -> str:
 
 
 def _caller_is_optional(macro: nodes.Macro) -> bool:
-    """Whether ``macro`` tests ``caller is defined`` or ``caller is undefined``.
+    """Whether this macro's own body tests ``caller is defined`` or ``caller is undefined``.
 
     A bare ``caller()`` call is not that test, so it leaves the parameter required.
+    A nested macro is a separate body, so its test does not make this caller optional.
     """
     return any(
         test.name in _DEFINEDNESS and isinstance(test.node, nodes.Name) and test.node.name == 'caller'
-        for test in macro.find_all(nodes.Test)
+        for test in _own_tests(macro.body)
     )
+
+
+def _own_tests(body: Iterable[nodes.Node]) -> Iterator[nodes.Test]:
+    for node in body:
+        if isinstance(node, nodes.Macro):
+            continue
+        if isinstance(node, nodes.Test):
+            yield node
+        yield from _own_tests(node.iter_child_nodes())
 
 
 def _macro_param(name: str, type_str: str | None, *, defaulted: bool) -> str:
@@ -702,7 +712,10 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     # skips underscore-prefixed names, so a `_tj_`-style name here would never be visible
     # at the call site below.
     name = f'tj_include_{flat_name(Path(_const_str(node.template) or "include"))}'
-    include_ctx = replace(ctx, seen=loaded.seen)
+    # Caller clauses are keyed by line number inside one template. Keeping the parent's
+    # map would attach its clause to an included macro that starts on the same line.
+    _, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    include_ctx = replace(ctx, macro_callers=callers, seen=loaded.seen)
     # +1 on every indent here: this content still has to pass through the same "inside
     # def _render(...):" unwrap every other emitted line does before it reaches the sidecar
     # (see _unwrap_render), so it has to start one level deep like everything else, not at
