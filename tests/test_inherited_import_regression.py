@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 from textwrap import dedent
 
@@ -293,3 +294,284 @@ def test_parent_accepts_a_well_typed_child_assignment(project: Path, *, set_firs
     template = write_template('templates/child.html', child)
 
     assert reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR), backend='mypy') == []
+
+
+_TYPED_FRAGMENT = """{#def
+x: str
+#}
+{% import "lib.html" as misc %}
+{{ misc.f(x) }}
+"""
+
+
+def _assignment_inside_function(code: str, name: str) -> bool:
+    """Whether ``name = ...`` appears inside a function body, not at module level."""
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for child in node.body:
+                if isinstance(child, ast.Assign):
+                    for target in child.targets:
+                        if isinstance(target, ast.Name) and target.id == name:
+                            return True
+    return False
+
+
+def _module_level_names(code: str) -> set[str]:
+    tree = ast.parse(code)
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.FunctionDef):
+            names.add(node.name)
+    return names
+
+
+def _aligned_include(tmp_path: Path, *fragments: str) -> tuple[str, str]:
+    """Transpile a parent that includes each fragment; return aligned code and sidecar."""
+    (tmp_path / 'lib.html').write_text(_LIB)
+    includes = []
+    for index, fragment in enumerate(fragments):
+        name = f'a{index}.html'
+        (tmp_path / name).write_text(fragment)
+        includes.append(f'{{% include "{name}" %}}')
+    source = '{#def\nx: str\n#}\n' + '\n'.join(includes) + '\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+    header = parse_header(source)
+    assert header is not None
+    generated = transpile(source, header, template_path=page)
+    aligned = layout(generated, header, 'page_tj_shared')
+    assert aligned is not None
+    return aligned.code, aligned.sidecar
+
+
+def test_two_typed_includes_bind_the_same_import_inside_each_function(tmp_path: Path):
+    """Each include owns its ``misc``; the parent stub must not assign it at module level."""
+    code, sidecar = _aligned_include(tmp_path, _TYPED_FRAGMENT, _TYPED_FRAGMENT)
+
+    assert sidecar.count('misc = _TJNS_misc') == 2
+    assert _assignment_inside_function(sidecar, 'misc')
+    assert 'misc' not in _module_level_names(sidecar)
+    assert 'misc =' not in code
+    ast.parse(sidecar)
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_two_typed_includes_can_import_different_templates_as_misc(project: Path):
+    """Two fragments may bind the same alias to different macros; a dedup would collapse them."""
+    (project / 'templates' / 'lib1.html').write_text(
+        '{% macro f(value) %}\n{#def\nvalue: str\n#}\n{{ value }}\n{% endmacro %}\n'
+    )
+    (project / 'templates' / 'lib2.html').write_text(
+        '{% macro g(value) %}\n{#def\nvalue: str\n#}\n{{ value }}\n{% endmacro %}\n'
+    )
+    write_template(
+        'templates/a0.html',
+        '{#def\nx: str\n#}\n{% import "lib1.html" as misc %}\n{{ misc.f(x) }}\n',
+    )
+    write_template(
+        'templates/a1.html',
+        '{#def\nx: str\n#}\n{% import "lib2.html" as misc %}\n{{ misc.g(x) }}\n',
+    )
+    template = write_template(
+        'templates/page.html',
+        '{#def\nx: str\n#}\n{% include "a0.html" %}\n{% include "a1.html" %}\n',
+    )
+
+    assert reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR)) == []
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_included_import_is_undefined_in_the_parent(project: Path):
+    """Jinja does not export an include's ``{% import %}``; the parent stub must not either."""
+    (project / 'templates' / 'lib.html').write_text(_LIB)
+    write_template(
+        'templates/a0.html',
+        '{#def\nx: str\n#}\n{% import "lib.html" as misc %}\n{{ misc.f(x) }}\n',
+    )
+    template = write_template(
+        'templates/page.html',
+        '{#def\nx: str\n#}\n{% include "a0.html" %}\n{{ misc }}\n',
+    )
+
+    found = reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR))
+
+    assert found
+    assert any(entry.mentions('misc') and entry.mentions('not defined') for entry in found)
+
+
+def test_two_untyped_includes_with_the_same_import_typecheck(tmp_path: Path):
+    """An untyped include parks the same no-arg function so its import is not a sidecar global."""
+    fragment = '{% import "lib.html" as misc %}\n{{ misc.f(x) }}\n'
+    code, sidecar = _aligned_include(tmp_path, fragment, fragment)
+
+    assert 'def tj_include_a0_html() -> None:' in sidecar
+    assert 'def tj_include_a1_html() -> None:' in sidecar
+    assert sidecar.count('misc = _TJNS_misc') == 2
+    assert _assignment_inside_function(sidecar, 'misc')
+    assert 'misc' not in _module_level_names(sidecar)
+    assert 'misc =' not in code
+    ast.parse(sidecar)
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_two_untyped_includes_leave_misc_undefined_in_the_parent(project: Path):
+    (project / 'templates' / 'lib.html').write_text(_LIB)
+    write_template('templates/a0.html', '{% import "lib.html" as misc %}\n{{ misc.f(x) }}\n')
+    write_template('templates/a1.html', '{% import "lib.html" as misc %}\n{{ misc.f(x) }}\n')
+    template = write_template(
+        'templates/page.html',
+        '{#def\nx: str\n#}\n{% include "a0.html" %}\n{% include "a1.html" %}\n{{ misc }}\n',
+    )
+
+    found = reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR))
+
+    assert found
+    assert any(entry.mentions('misc') and entry.mentions('not defined') for entry in found)
+    assert not any(entry.mentions('multiple types') for entry in found)
+
+
+def test_two_includes_with_the_same_from_import(tmp_path: Path):
+    """``{% from %}`` stubs live inside each include function, not as two module-level defs."""
+    fragment = '{#def\nx: str\n#}\n{% from "lib.html" import f %}\n{{ f(x) }}\n'
+    _, sidecar = _aligned_include(tmp_path, fragment, fragment)
+
+    tree = ast.parse(sidecar)
+    module_defs = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert module_defs.count('f') == 0
+    nested = [
+        child.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        for child in node.body
+        if isinstance(child, ast.FunctionDef)
+    ]
+    assert nested.count('f') == 2
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_two_includes_with_the_same_from_import_typecheck(project: Path):
+    (project / 'templates' / 'lib.html').write_text(_LIB)
+    write_template('templates/a0.html', '{#def\nx: str\n#}\n{% from "lib.html" import f %}\n{{ f(x) }}\n')
+    write_template('templates/a1.html', '{#def\nx: str\n#}\n{% from "lib.html" import f %}\n{{ f(x) }}\n')
+    template = write_template(
+        'templates/page.html',
+        '{#def\nx: str\n#}\n{% include "a0.html" %}\n{% include "a1.html" %}\n',
+    )
+
+    assert reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR)) == []
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_nested_include_import_does_not_leak(project: Path):
+    """An import in an inner include stays there; the outer template does not see it."""
+    (project / 'templates' / 'lib.html').write_text(_LIB)
+    write_template(
+        'templates/inner.html',
+        '{#def\nx: str\n#}\n{% import "lib.html" as misc %}\n{{ misc.f(x) }}\n',
+    )
+    outer = write_template(
+        'templates/outer.html',
+        '{#def\nx: str\n#}\n{% include "inner.html" %}\n{{ misc }}\n',
+    )
+    write_template(
+        'templates/page.html',
+        '{#def\nx: str\n#}\n{% include "outer.html" %}\n',
+    )
+
+    found = reported(outer, Config(template_dirs=['templates'], out_dir=STUB_DIR))
+    assert found
+    assert any(entry.mentions('misc') and entry.mentions('not defined') for entry in found)
+
+    assert (
+        reported(
+            Path('templates/inner.html'),
+            Config(template_dirs=['templates'], out_dir=STUB_DIR),
+        )
+        == []
+    )
+
+
+def test_nested_include_import_lives_under_the_inner_function(tmp_path: Path):
+    (tmp_path / 'lib.html').write_text(_LIB)
+    (tmp_path / 'inner.html').write_text(
+        '{#def\nx: str\n#}\n{% import "lib.html" as misc %}\n{{ misc.f(x) }}\n'
+    )
+    (tmp_path / 'outer.html').write_text('{#def\nx: str\n#}\n{% include "inner.html" %}\n')
+    source = '{#def\nx: str\n#}\n{% include "outer.html" %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+    header = parse_header(source)
+    assert header is not None
+    generated = transpile(source, header, template_path=page)
+    aligned = layout(generated, header, 'page_tj_shared')
+    assert aligned is not None
+    sidecar = aligned.sidecar
+    ast.parse(sidecar)
+
+    tree = ast.parse(sidecar)
+    by_name = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert 'tj_include_inner_html' in by_name
+    assert 'tj_include_outer_html' in by_name
+    inner_assigns = [
+        target.id
+        for child in by_name['tj_include_inner_html'].body
+        if isinstance(child, ast.Assign)
+        for target in child.targets
+        if isinstance(target, ast.Name)
+    ]
+    outer_assigns = [
+        target.id
+        for child in by_name['tj_include_outer_html'].body
+        if isinstance(child, ast.Assign)
+        for target in child.targets
+        if isinstance(target, ast.Name)
+    ]
+    assert 'misc' in inner_assigns
+    assert 'misc' not in outer_assigns
+
+
+@pytest.mark.parametrize(
+    'direction',
+    [
+        'base_imports',
+        'child_imports',
+    ],
+)
+@requires_checker(DEFAULT_BACKEND)
+def test_extends_import_stays_visible_across_the_chain(project: Path, direction: str):
+    """``{% extends %}`` shares context; an import on either side reaches the other."""
+    (project / 'templates' / 'lib.html').write_text(_LIB)
+    if direction == 'base_imports':
+        (project / 'templates' / 'base.html').write_text(
+            '{% import "lib.html" as misc %}\n{% block body %}{% endblock %}\n'
+        )
+        child = '{#def\nx: str\n#}\n{% extends "base.html" %}\n{% block body %}{{ misc.f(x) }}{% endblock %}\n'
+    else:
+        (project / 'templates' / 'base.html').write_text('{{ misc.f(x) }}\n{% block body %}{% endblock %}\n')
+        child = (
+            '{#def\nx: str\n#}\n{% import "lib.html" as misc %}\n'
+            '{% extends "base.html" %}\n{% block body %}{% endblock %}\n'
+        )
+    template = write_template('templates/child.html', child)
+
+    assert reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR)) == []
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_untyped_include_set_does_not_leak(project: Path):
+    """Wrapping an untyped include keeps its ``{% set %}`` out of the parent stub."""
+    write_template('templates/frag.html', '{% set page_title = "Hello" %}\n')
+    template = write_template(
+        'templates/page.html',
+        '{#def\nx: str\n#}\n{% include "frag.html" %}\n{{ page_title }}\n',
+    )
+
+    found = reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR))
+
+    assert found
+    assert any(entry.mentions('page_title') and entry.mentions('not defined') for entry in found)
