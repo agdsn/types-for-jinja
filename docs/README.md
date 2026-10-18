@@ -112,6 +112,38 @@ body and its callers, across files:
 
 Without that block the parameters stay untyped and only arity is checked.
 
+A macro's `{#def #}` block may contain one `caller(...)` clause.
+`caller()` means the macro must be invoked with `{% call %}`, and the callback
+takes no arguments.
+`caller(user: User)` types the values the macro passes to `caller(...)`.
+An optional `->` annotation types what `caller()` returns inside the macro,
+for example `caller(user: User) -> Markup`.
+The call block names its own parameters.
+`{% call(person) dump_users(users) %}` types `person` from the first slot,
+by position, not by the name `user`.
+
+```jinja
+{% macro dump_users(users) %}
+  {#def
+  from examples.models import User
+  users: list[User]
+  caller(user: User)
+  #}
+  {% for user in users %}
+    {{ caller(user) }}
+  {% endfor %}
+{% endmacro %}
+{% call(person) dump_users(users) %}
+  {{ person.name }}
+{% endcall %}
+```
+
+Without the clause, the macro takes no caller.
+If the macro body tests `caller is defined` or `caller is undefined`, the
+callback is optional.
+A parameter named `caller`, written `caller: str`, is an ordinary argument.
+That declaration is not a `caller(...)` clause.
+
 JinjaX writes the whole context on one line, with commas between, defaults
 allowed, and untyped names allowed.
 Both spellings parse, and they can be mixed:
