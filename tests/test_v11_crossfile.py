@@ -128,3 +128,74 @@ def test_from_import_wrong_arity_errors(examples_project):
     found = reported(template, _CONFIG)
 
     assert [entry.line for entry in found] == [5]
+
+
+_CALLER_MACRO = """{% macro dump_users(users) %}
+{#def
+from examples.models import User
+users: list[User]
+caller(user: User)
+#}
+{% for user in users %}
+{{ caller(user) }}
+{% endfor %}
+{% endmacro %}
+"""
+
+
+def _imported_call(name: str, directive: str, call: str, attribute: str) -> list[checked.Reported]:
+    """Check a page that imports ``dump_users`` and calls it with a call block."""
+    write_template('examples/crossfile/macros.html', _CALLER_MACRO)
+    page = (
+        '{#def\nfrom examples.models import User\nusers: list[User]\n#}\n'
+        f'{directive}\n'
+        f'{{% call(person) {call} %}}\n'
+        f'{{{{ person.{attribute} }}}}\n'
+        '{% endcall %}\n'
+    )
+    template = write_template(f'examples/crossfile/{name}.html.jinja', page)
+    return reported(template, _CONFIG)
+
+
+def test_from_import_call_block_typo_is_an_error(examples_project):
+    found = _imported_call(
+        'from_call_naem',
+        '{% from "macros.html" import dump_users %}',
+        'dump_users(users)',
+        'naem',
+    )
+
+    assert any(entry.mentions('naem') for entry in found)
+
+
+def test_from_import_call_block_is_clean(examples_project):
+    found = _imported_call(
+        'from_call_name',
+        '{% from "macros.html" import dump_users %}',
+        'dump_users(users)',
+        'name',
+    )
+
+    assert found == []
+
+
+def test_import_call_block_typo_is_an_error(examples_project):
+    found = _imported_call(
+        'ns_call_naem',
+        '{% import "macros.html" as ns %}',
+        'ns.dump_users(users)',
+        'naem',
+    )
+
+    assert any(entry.mentions('naem') for entry in found)
+
+
+def test_import_call_block_is_clean(examples_project):
+    found = _imported_call(
+        'ns_call_name',
+        '{% import "macros.html" as ns %}',
+        'ns.dump_users(users)',
+        'name',
+    )
+
+    assert found == []
