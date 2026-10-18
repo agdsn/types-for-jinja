@@ -230,3 +230,70 @@ def test_a_caller_clause_and_a_parameter_named_caller_are_malformed():
     assert 'caller' in message
     assert 'not a valid parameter list' not in message
     assert header.caller is None
+
+
+def test_an_escaped_triple_quote_keeps_the_separator_before_a_caller_clause():
+    """The escaped quote stays in the default, so the comma after the string separates a real caller clause.
+
+    A template header reports that clause and keeps the parameter.
+    """
+    header = parse_header('{#def name: str = """hello\\"""", caller(user: User) #}\n')
+
+    assert header is not None
+    assert header.params == [Param('name', 'str', "'hello\"'")]
+    assert header.caller is None
+    message = header_errors(header)[0]
+    assert 'a caller clause belongs on a macro' in message
+    assert 'not a valid parameter list' not in message
+
+
+def test_a_macro_reads_the_caller_after_an_escaped_triple_quote():
+    """Inside a macro, that same comma is the caller clause and the default stays on the parameter."""
+    source = '{% macro card() %}\n{#def name: str = """hello\\"""", caller(user: User) #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == [Param('name', 'str', "'hello\"'")]
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[Param('user', 'User')], returns=None)
+
+
+def test_text_inside_a_triple_quoted_default_is_not_a_caller_clause():
+    """caller(user: User) inside the default is text, so the header has one parameter and no clause."""
+    header = parse_header('{#def name: str = """a\\""", caller(user: User)""" #}\n')
+
+    assert header is not None
+    assert header_errors(header) == []
+    assert header.params == [Param('name', 'str', '\'a""", caller(user: User)\'')]
+    assert header.caller is None
+
+
+def test_a_macro_leaves_caller_text_inside_a_triple_quoted_default():
+    """Inside a macro, that same default is still one parameter and header.caller stays unset."""
+    source = '{% macro card() %}\n{#def name: str = """a\\""", caller(user: User)""" #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header_errors(header) == []
+    assert header.params == [Param('name', 'str', '\'a""", caller(user: User)\'')]
+    assert header.caller is None
+
+
+def test_a_nested_fstring_quote_is_not_a_caller_clause():
+    """A 3.12 f-string may reuse its quote inside the braces, and that text is not a caller clause."""
+    header = parse_header('{#def label: str = f"{d["a, caller(user: User)"]}" #}\n')
+
+    assert header is not None
+    assert header_errors(header) == []
+    assert header.params == [Param('label', 'str', 'f"{d[\'a, caller(user: User)\']}"')]
+    assert header.caller is None
+
+
+def test_a_macro_leaves_caller_text_inside_a_nested_fstring_quote():
+    """Inside a macro, the nested quote stays in the default and header.caller stays unset."""
+    source = '{% macro card() %}\n{#def label: str = f"{d["a, caller(user: User)"]}" #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header_errors(header) == []
+    assert header.params == [Param('label', 'str', 'f"{d[\'a, caller(user: User)\']}"')]
+    assert header.caller is None
