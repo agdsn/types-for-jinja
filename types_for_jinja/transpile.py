@@ -8,7 +8,10 @@ line carries a ``# L<n>`` marker back to its source line in the template.
 
 from __future__ import annotations
 
+import contextvars
 import keyword
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -35,6 +38,11 @@ _CMP_OPS = {
 _ANY = '_TJAny'
 """What an untyped header name is annotated as; the preamble imports ``Any`` under this alias."""
 
+_DEFAULT_FILTERS = frozenset({'default', 'd'})
+"""Filters that accept a missing value instead of raising, ``StrictUndefined`` included."""
+
+_BOUND: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar('_tj_bound_names', default=frozenset())
+
 JINJA_GLOBALS = ('cycler', 'joiner', 'lipsum', 'namespace')
 """Globals Jinja puts in every Environment, which are otherwise undefined variables.
 
@@ -55,6 +63,8 @@ class _Emit:
     env: Environment
     syntax: Syntax
     seen: frozenset[Path] = frozenset()
+    # Header params, configured globals, and Jinja's own globals: visible in every nested stub.
+    ambient: frozenset[str] = frozenset()
 
 
 def macro_defs(source: str, tree: nodes.Template, syntax: Syntax | None = None) -> tuple[MacroTypes, list[str]]:
@@ -164,15 +174,49 @@ def transpile(
     env = build_environment(config.syntax, config.extensions)
     tree = env.parse(source)
     macro_types, macro_imports = macro_defs(source, tree, config.syntax)
+    ambient = _ambient_names(tree, header, config)
     ctx = _Emit(
         macro_types=macro_types,
         search_dirs=_search_dirs(template_path, config),
         env=env,
         syntax=config.syntax,
         seen=frozenset({template_path.resolve()} if template_path is not None else ()),
+        ambient=ambient,
     )
-    split = _split_top_level(tree, ctx)
+    # Set before ``_split_top_level``: loading a base template emits its macros immediately.
+    token = _BOUND.set(ambient | _bindings_in([tree]))
+    try:
+        split = _split_top_level(tree, ctx)
+        # Assignments in the extended template are in scope for its expressions.
+        widened = _BOUND.set(_BOUND.get() | _bindings_in(split.base_nodes))
+        try:
+            return _emit_module(
+                source=source,
+                header=header,
+                config=config,
+                depth=depth,
+                ctx=ctx,
+                tree=tree,
+                macro_imports=macro_imports,
+                split=split,
+            )
+        finally:
+            _BOUND.reset(widened)
+    finally:
+        _BOUND.reset(token)
 
+
+def _emit_module(
+    *,
+    source: str,
+    header: TemplateHeader,
+    config: Config,
+    depth: int,
+    ctx: _Emit,
+    tree: nodes.Template,
+    macro_imports: list[str],
+    split: _TopLevel,
+) -> GeneratedModule:
     uses, component_defs = _component_uses(source, ctx.search_dirs)
     lines = _preamble(
         header,
@@ -487,7 +531,10 @@ def _emit_macro(
     signature = _macro_params(node, ctx.macro_types)
     out.append(Line(indent, f'def {name}({signature}) -> _TJAny:', node.lineno))
     inner: list[Line] = []
-    _emit_body(node.body, inner, indent + 1, ctx)
+    # A macro's parameters are local to its body, including one loaded from a base template
+    # whose names were not part of the caller's scope.
+    with _scoped(_BOUND.get() | {arg.name for arg in node.args}):
+        _emit_body(node.body, inner, indent + 1, ctx)
     if not inner:
         inner.append(Line(indent + 1, 'pass', node.lineno))
     out.extend(inner)
@@ -592,9 +639,13 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     body: list[Line] = [Line(1, imp, node.lineno) for imp in header.imports]
     body.append(Line(1, f'def {name}({_signature(header)}) -> None:', node.lineno))
     # depth=0: the sidecar this lands in always sits at the output root (see _sidecar).
-    inner: list[Line] = [Line(2, imp, node.lineno) for imp in filter_imports(loaded.tree, depth=0)]
-    top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
-    _emit_body(top_level, inner, 2, include_ctx)
+    # The included body is checked as its own function, so only its header, its own
+    # bindings, and the ambient names (which the sidecar preamble still declares) are in scope.
+    include_names = ctx.ambient | {param.name for param in header.params} | _bindings_in([loaded.tree])
+    with _scoped(include_names):
+        inner: list[Line] = [Line(2, imp, node.lineno) for imp in filter_imports(loaded.tree, depth=0)]
+        top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
+        _emit_body(top_level, inner, 2, include_ctx)
     if not inner:
         inner.append(Line(2, 'pass', node.lineno))
     body.extend(inner)
@@ -615,7 +666,9 @@ def _emit_untyped_include(
     types, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     body = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
     inner: list[Line] = []
-    _emit_body(body, inner, indent, replace(ctx, macro_types=types, seen=loaded.seen))
+    # An untyped include is inlined into the caller's scope, plus the names it binds itself.
+    with _scoped(_BOUND.get() | _bindings_in(body)):
+        _emit_body(body, inner, indent, replace(ctx, macro_types=types, seen=loaded.seen))
     out.extend(_mark_foreign(inner, node.lineno))
 
 
@@ -790,14 +843,106 @@ def _call(node: nodes.Call) -> str:
     return f'{_expr(node.node)}(' + ', '.join(args) + ')'
 
 
+def _ambient_names(tree: nodes.Template, header: TemplateHeader, config: Config) -> frozenset[str]:
+    """Names the generated module binds for the whole template, not inside one block."""
+    names = {param.name for param in header.params}
+    names.update(name for name, _ in config.globals)
+    names.update(_extension_globals(config))
+    names.update(_jinja_globals(tree, config))
+    return frozenset(names)
+
+
+def _bindings_in(roots: list[nodes.Node]) -> frozenset[str]:
+    """Every name ``roots`` bind: assignments, loop targets, macros, and imports."""
+    names: set[str] = set()
+    for root in roots:
+        names.update(_binding_names(root))
+        for node in root.find_all(nodes.Node):
+            names.update(_binding_names(node))
+    return frozenset(names)
+
+
+def _binding_names(node: nodes.Node) -> list[str]:
+    match node:
+        case nodes.Assign() | nodes.AssignBlock() | nodes.For():
+            return _stored_names(node.target)
+        case nodes.With():
+            return [name for target in node.targets for name in _stored_names(target)]
+        case nodes.Macro():
+            return [node.name, *(arg.name for arg in node.args)]
+        case nodes.Import():
+            return [node.target]
+        case nodes.FromImport():
+            return [entry[1] if isinstance(entry, tuple) else entry for entry in node.names]
+        case _:
+            return []
+
+
+def _stored_names(target: nodes.Node) -> list[str]:
+    match target:
+        case nodes.Name():
+            return [target.name]
+        case nodes.Tuple() | nodes.List():
+            return [name for item in target.items for name in _stored_names(item)]
+        case _:
+            return []
+
+
+@contextmanager
+def _scoped(names: frozenset[str]) -> Iterator[None]:
+    """Bind ``names`` for the duration of one nested emit."""
+    token = _BOUND.set(names)
+    try:
+        yield
+    finally:
+        _BOUND.reset(token)
+
+
 def _filtered(node: nodes.Filter | nodes.Test) -> str:
     """Apply a filter or test as a call, using its declared signature when there is one."""
     if node.node is None:
         raise UnsupportedTemplateError(type(node).__name__)
+    softened = _soft_default(node)
+    if softened is not None:
+        return _softened_default(softened)
     args = [_expr(node.node)]
     args.extend(_expr(arg) for arg in node.args)
     args.extend(f'{kw.key}={_expr(kw.value)}' for kw in node.kwargs)
     return f'{_filter_callable(node)}(' + ', '.join(args) + ')'
+
+
+def _soft_default(node: nodes.Node) -> nodes.Filter | None:
+    """A ``default``/``d`` whose value is a bare name this template never binds.
+
+    Jinja passes that name in as an Undefined object instead of raising, and that is true
+    with ``StrictUndefined`` as well. The filter then returns its default argument, so the
+    stub has to check that argument rather than the missing name. Attribute access stays
+    strict: ``foo.bar | default`` still raises under ``StrictUndefined``.
+    """
+    if not isinstance(node, nodes.Filter) or node.name not in _DEFAULT_FILTERS:
+        return None
+    value = node.node
+    if isinstance(value, nodes.Name) and value.ctx == 'load' and value.name not in _BOUND.get():
+        return node
+    return None
+
+
+def _softened_default(node: nodes.Filter) -> str:
+    """The default argument, which is the value of ``default`` for an unbound name."""
+    positional = [_expr(arg) for arg in node.args]
+    value = positional[0] if positional else "''"
+    checked = positional[1:]
+    for kw in node.kwargs:
+        rendered = _expr(kw.value)
+        if not positional and kw.key == 'default_value':
+            value = rendered
+        else:
+            checked.append(rendered)
+    if not checked:
+        return value
+    # The extras (the ``boolean`` flag, usually) still need checking. Indexing keeps the
+    # default argument's type as the type of the whole expression.
+    return f'({value}, {", ".join(checked)})[0]'
 
 
 def _filter_callable(node: nodes.Filter | nodes.Test) -> str:
@@ -818,7 +963,7 @@ def filter_imports(*trees: nodes.Node, depth: int = 0) -> list[str]:
         used.update(
             filters.stub_name(node.name)
             for node in tree.find_all(nodes.Filter)
-            if node.node is not None and node.name in filters.RETURNS
+            if node.node is not None and node.name in filters.RETURNS and _soft_default(node) is None
         )
         if any(node.node is not None for node in tree.find_all(nodes.Test)):
             used.add(filters.TEST_STUB)
