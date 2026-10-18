@@ -65,6 +65,9 @@ class _Emit:
     seen: frozenset[Path] = frozenset()
     # Header params, configured globals, and Jinja's own globals: visible in every nested stub.
     ambient: frozenset[str] = frozenset()
+    # Imports from a template pulled in by ``{% include %}``. They have to stay outside
+    # ``_render``: layout dedents the render body, which would pull a namespace class apart.
+    included_imports: list[Line] = field(default_factory=list)
 
 
 def macro_defs(source: str, tree: nodes.Template, syntax: Syntax | None = None) -> tuple[MacroTypes, list[str]]:
@@ -229,6 +232,7 @@ def _emit_module(
     lines.extend(split.foreign_defs)
     lines.extend(split.module_defs)
 
+    render_at = len(lines)
     lines.append(Line(0, f'def _render({_signature(header)}) -> None:', header.lineno))
     body: list[Line] = []
     _emit_body(split.render_nodes, body, 1, ctx)
@@ -243,6 +247,8 @@ def _emit_module(
         body.extend(_exported_assignments(split.render_nodes, split.base_lineno))
     body.extend(_mark_foreign(inherited, split.base_lineno))
     body.extend(Line(1, use.call, use.lineno) for use in uses)
+    # Filled while the body was emitted. Inserted above ``_render`` so the dedent leaves them.
+    lines[render_at:render_at] = ctx.included_imports
     body.sort(key=lambda line: line.lineno)
     if not body:
         body.append(Line(1, 'pass', header.lineno))
@@ -649,6 +655,7 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     with _scoped(include_names):
         inner: list[Line] = [Line(2, imp, node.lineno) for imp in filter_imports(loaded.tree, depth=0)]
         top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
+        _emit_included_imports(top_level, include_ctx, node.lineno)
         _emit_body(top_level, inner, 2, include_ctx)
     if not inner:
         inner.append(Line(2, 'pass', node.lineno))
@@ -670,9 +677,11 @@ def _emit_untyped_include(
     types, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     body = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
     inner: list[Line] = []
+    included = replace(ctx, macro_types=types, seen=loaded.seen)
+    _emit_included_imports(body, included, node.lineno)
     # An untyped include is inlined into the caller's scope, plus the names it binds itself.
     with _scoped(_BOUND.get() | _bindings_in(body)):
-        _emit_body(body, inner, indent, replace(ctx, macro_types=types, seen=loaded.seen))
+        _emit_body(body, inner, indent, included)
     out.extend(_mark_foreign(inner, node.lineno))
 
 
@@ -700,6 +709,19 @@ def _load_template(reference: nodes.Node, ctx: _Emit) -> _LoadedTemplate | None:
     except TemplateSyntaxError:
         return None
     return _LoadedTemplate(source=source, tree=tree, seen=ctx.seen | {path.resolve()})
+
+
+def _emit_included_imports(nodes: list[nodes.Node], ctx: _Emit, lineno: int) -> None:
+    """Bind ``{% import %}`` and ``{% from %}`` from a template ``{% include %}`` pulls in.
+
+    The included body is copied into this stub, so a call there is checked here. The import
+    tag is not itself a call, and dropping it leaves the alias undefined.
+    """
+    defs: list[Line] = []
+    found: list[str] = []
+    _emit_nested_imports(nodes, ctx, defs, found)
+    ctx.included_imports.extend(_mark_foreign([Line(0, text, lineno) for text in _unique(found)], lineno))
+    ctx.included_imports.extend(_mark_foreign(defs, lineno))
 
 
 def _emit_nested_imports(
