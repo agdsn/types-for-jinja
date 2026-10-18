@@ -883,8 +883,10 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
         _emit_included_imports(top_level, include_ctx, node.lineno)
         _register_local_callers(loaded.tree, include_ctx)
         _emit_body(top_level, inner, 2, include_ctx)
-    if not inner:
-        inner.append(Line(2, 'pass', node.lineno))
+    # A nested typed include emits its own def at this function's indent, which ends the
+    # suite before any indented statement. `pass` keeps the function a valid suite.
+    if not inner or inner[0].indent <= 1:
+        inner.insert(0, Line(2, 'pass', node.lineno))
     body.extend(inner)
     out.extend(_mark_foreign(body, node.lineno))
     # A bare call, not `_ = ...`: the function is declared `-> None`, and mypy's
