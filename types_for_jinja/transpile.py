@@ -75,9 +75,10 @@ class _Emit:
     seen: frozenset[Path] = frozenset()
     # Header params, configured globals, and Jinja's own globals: visible in every nested stub.
     ambient: frozenset[str] = frozenset()
-    # Imports from a template pulled in by ``{% include %}``. They have to stay outside
-    # ``_render``: layout dedents the render body, which would pull a namespace class apart.
-    included_imports: list[Line] = field(default_factory=list)
+    # Parked ``{% include %}`` functions (and their Python imports). Inserted above ``_render``
+    # at final indents so layout's unwrap does not touch them; the class under each def stays
+    # scoped to that include.
+    include_fns: list[Line] = field(default_factory=list)
     # Template text for the file being emitted. ``{% endcall %}`` is not on the AST.
     source: str = ''
     # Callee name, ``{% from %}`` alias, or ``ns.macro``, to the clause that types the call block.
@@ -268,8 +269,8 @@ def _emit_module(
         body.extend(_exported_assignments(split.render_nodes, split.base_lineno))
     body.extend(_mark_foreign(inherited, split.base_lineno))
     body.extend(Line(1, use.call, use.lineno) for use in uses)
-    # Filled while the body was emitted. Inserted above ``_render`` so the dedent leaves them.
-    lines[render_at:render_at] = ctx.included_imports
+    # Filled while the body was emitted. Inserted above ``_render`` so unwrap leaves them.
+    lines[render_at:render_at] = ctx.include_fns
     body.sort(key=lambda line: line.lineno)
     if not body:
         body.append(Line(1, 'pass', header.lineno))
@@ -849,8 +850,12 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     site (emitted locally, at the include's own position) passes the includer's own names
     for each declared parameter. A name the include needs and the includer never bound is
     now a real error at the include tag, not a silent pass through a sidecar no local name
-    reaches. An untyped include (no header) falls back to sharing raw, unchecked context,
-    since there is nothing to build a signature from.
+    reaches. An untyped include (no header) falls back to a no-arg wrapper over the same
+    parked form, since there is nothing to build a signature from.
+
+    The function itself is parked above ``_render`` at final indents. Only the call goes
+    into ``out``, so a nested include's def does not close the outer suite, and each
+    include's ``{% import %}`` stays inside its own function.
     """
     loaded = _load_template(node.template, ctx)
     if loaded is None:
@@ -867,28 +872,27 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     # map would attach its clause to an included macro that starts on the same line.
     _, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     include_ctx = replace(ctx, macro_callers=callers, seen=loaded.seen, source=loaded.source)
-    # +1 on every indent here: this content still has to pass through the same "inside
-    # def _render(...):" unwrap every other emitted line does before it reaches the sidecar
-    # (see _unwrap_render), so it has to start one level deep like everything else, not at
-    # the module level it will actually land at.
-    body: list[Line] = [Line(1, imp, node.lineno) for imp in header.imports]
-    body.append(Line(1, f'def {name}({_signature(header)}) -> None:', node.lineno))
     # depth=0: the sidecar this lands in always sits at the output root (see _sidecar).
     # The included body is checked as its own function, so only its header, its own
     # bindings, and the ambient names (which the sidecar preamble still declares) are in scope.
     include_names = ctx.ambient | {param.name for param in header.params} | _bindings_in([loaded.tree])
+    top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
+    inner: list[Line] = []
     with _scoped(include_names):
-        inner: list[Line] = [Line(2, imp, node.lineno) for imp in filter_imports(loaded.tree, depth=0)]
-        top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
-        _emit_included_imports(top_level, include_ctx, node.lineno)
+        py_imports = _emit_included_imports(top_level, include_ctx, node.lineno, inner, indent=1)
         _register_local_callers(loaded.tree, include_ctx)
-        _emit_body(top_level, inner, 2, include_ctx)
-    # A nested typed include emits its own def at this function's indent, which ends the
-    # suite before any indented statement. `pass` keeps the function a valid suite.
-    if not inner or inner[0].indent <= 1:
-        inner.insert(0, Line(2, 'pass', node.lineno))
-    body.extend(inner)
-    out.extend(_mark_foreign(body, node.lineno))
+        _emit_body(top_level, inner, 1, include_ctx)
+    if not inner or inner[0].indent < 1:
+        inner.insert(0, Line(1, 'pass', node.lineno))
+    parked = [
+        *[
+            Line(0, text, node.lineno)
+            for text in _unique([*header.imports, *filter_imports(loaded.tree, depth=0), *py_imports])
+        ],
+        Line(0, f'def {name}({_signature(header)}) -> None:', node.lineno),
+        *inner,
+    ]
+    ctx.include_fns.extend(_mark_foreign(parked, node.lineno))
     # A bare call, not `_ = ...`: the function is declared `-> None`, and mypy's
     # func-returns-value flags assigning a None-returning call's result even to `_`.
     call_args = ', '.join(f'{param.name}={param.name}' for param in header.params)
@@ -902,16 +906,29 @@ def _emit_untyped_include(
     indent: int,
     ctx: _Emit,
 ) -> None:
+    """Park an untyped include as a no-arg function so its imports and sets stay local.
+
+    Jinja does not export names an include binds. Inlining into the sidecar would make
+    ``import *`` leak them into the parent; the wrapper matches runtime.
+    """
+    name = f'tj_include_{flat_name(Path(_const_str(node.template) or "include"))}'
     types, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     body = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
-    inner: list[Line] = []
     included = replace(ctx, macro_types=types, macro_callers=callers, seen=loaded.seen, source=loaded.source)
-    _emit_included_imports(body, included, node.lineno)
+    inner: list[Line] = []
+    py_imports = _emit_included_imports(body, included, node.lineno, inner, indent=1)
     _register_local_callers(loaded.tree, included)
-    # An untyped include is inlined into the caller's scope, plus the names it binds itself.
-    with _scoped(_BOUND.get() | _bindings_in(body)):
-        _emit_body(body, inner, indent, included)
-    out.extend(_mark_foreign(inner, node.lineno))
+    with _scoped(ctx.ambient | _bindings_in(body)):
+        _emit_body(body, inner, 1, included)
+    if not inner or inner[0].indent < 1:
+        inner.insert(0, Line(1, 'pass', node.lineno))
+    parked = [
+        *[Line(0, text, node.lineno) for text in _unique([*filter_imports(loaded.tree, depth=0), *py_imports])],
+        Line(0, f'def {name}() -> None:', node.lineno),
+        *inner,
+    ]
+    ctx.include_fns.extend(_mark_foreign(parked, node.lineno))
+    out.append(Line(indent, f'{name}()', node.lineno))
 
 
 @dataclass(frozen=True)
@@ -940,17 +957,25 @@ def _load_template(reference: nodes.Node, ctx: _Emit) -> _LoadedTemplate | None:
     return _LoadedTemplate(source=source, tree=tree, seen=ctx.seen | {path.resolve()})
 
 
-def _emit_included_imports(nodes: list[nodes.Node], ctx: _Emit, lineno: int) -> None:
-    """Bind ``{% import %}`` and ``{% from %}`` from a template ``{% include %}`` pulls in.
+def _emit_included_imports(
+    nodes: list[nodes.Node],
+    ctx: _Emit,
+    lineno: int,
+    body: list[Line],
+    *,
+    indent: int,
+) -> list[str]:
+    """Bind ``{% import %}`` and ``{% from %}`` into an include function's body.
 
-    The included body is copied into this stub, so a call there is checked here. The import
-    tag is not itself a call, and dropping it leaves the alias undefined.
+    Returns the Python import lines those macros declare, which park beside the function
+    at indent 0. The Jinja bindings go into ``body`` at ``indent`` so each include owns
+    its alias.
     """
     defs: list[Line] = []
     found: list[str] = []
-    _emit_nested_imports(nodes, ctx, defs, found)
-    ctx.included_imports.extend(_mark_foreign([Line(0, text, lineno) for text in _unique(found)], lineno))
-    ctx.included_imports.extend(_mark_foreign(defs, lineno))
+    _emit_nested_imports(nodes, ctx, defs, found, indent=indent)
+    body.extend(_mark_foreign(defs, lineno))
+    return _unique(found)
 
 
 def _emit_nested_imports(
@@ -958,6 +983,8 @@ def _emit_nested_imports(
     ctx: _Emit,
     module_defs: list[Line],
     imports: list[str],
+    *,
+    indent: int = 0,
 ) -> None:
     """Bind macros imported from inside a block, branch, or macro.
 
@@ -966,7 +993,7 @@ def _emit_nested_imports(
     emits the call and drops the binding, and the checker reports the alias as undefined.
     """
     for root in roots:
-        _emit_imports_under(root, ctx, module_defs, imports)
+        _emit_imports_under(root, ctx, module_defs, imports, indent=indent)
 
 
 def _emit_imports_under(
@@ -974,17 +1001,19 @@ def _emit_imports_under(
     ctx: _Emit,
     module_defs: list[Line],
     imports: list[str],
+    *,
+    indent: int = 0,
 ) -> None:
     defs: list[Line] = []
     match node:
         case nodes.Import():
-            _emit_import(node, ctx, defs, imports)
+            _emit_import(node, ctx, defs, imports, indent=indent)
             module_defs.extend(_mark_foreign(defs, node.lineno))
         case nodes.FromImport():
-            _emit_from_import(node, ctx, defs, imports)
+            _emit_from_import(node, ctx, defs, imports, indent=indent)
             module_defs.extend(_mark_foreign(defs, node.lineno))
     for child in node.iter_child_nodes():
-        _emit_imports_under(child, ctx, module_defs, imports)
+        _emit_imports_under(child, ctx, module_defs, imports, indent=indent)
 
 
 def _emit_from_import(
@@ -992,6 +1021,8 @@ def _emit_from_import(
     ctx: _Emit,
     module_defs: list[Line],
     imports: list[str],
+    *,
+    indent: int = 0,
 ) -> None:
     loaded = _load_macros(node.template, ctx)
     if loaded is None or not loaded.macros:
@@ -1004,7 +1035,7 @@ def _emit_from_import(
             _emit_macro_stub(
                 macro,
                 module_defs,
-                0,
+                indent,
                 replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers),
                 alias=alias,
             )
@@ -1016,20 +1047,24 @@ def _emit_import(
     ctx: _Emit,
     module_defs: list[Line],
     imports: list[str],
+    *,
+    indent: int = 0,
 ) -> None:
     loaded = _load_macros(node.template, ctx)
     if loaded is None:
         return
     imports.extend(loaded.imports)
     cls = f'_TJNS_{node.target}'
-    module_defs.append(Line(0, f'class {cls}:', node.lineno))
+    module_defs.append(Line(indent, f'class {cls}:', node.lineno))
     if not loaded.macros:
-        module_defs.append(Line(1, 'pass', node.lineno))
+        module_defs.append(Line(indent + 1, 'pass', node.lineno))
     for macro in loaded.macros.values():
-        module_defs.append(Line(1, '@staticmethod', macro.lineno))
-        _emit_macro_stub(macro, module_defs, 1, replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers))
+        module_defs.append(Line(indent + 1, '@staticmethod', macro.lineno))
+        _emit_macro_stub(
+            macro, module_defs, indent + 1, replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers)
+        )
         _remember_caller(ctx, f'{node.target}.{macro.name}', loaded.callers.get(macro.lineno))
-    module_defs.append(Line(0, f'{node.target} = {cls}', node.lineno))
+    module_defs.append(Line(indent, f'{node.target} = {cls}', node.lineno))
 
 
 def _emit_expr_check(expr: nodes.Node, out: list[Line], indent: int) -> None:
