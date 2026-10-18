@@ -274,6 +274,7 @@ def _split_top_level(tree: nodes.Template, ctx: _Emit) -> _TopLevel:
         match node:
             case nodes.Macro():
                 _emit_macro(node, split.module_defs, ctx)
+                _emit_nested_imports(node.body, ctx, split.foreign_defs, split.imports)
             case nodes.Extends():
                 defs: list[Line] = []
                 split.base_nodes.extend(_load_base_nodes(node, ctx, defs, split.imports))
@@ -289,6 +290,7 @@ def _split_top_level(tree: nodes.Template, ctx: _Emit) -> _TopLevel:
                 split.foreign_defs.extend(_mark_foreign(defs, node.lineno))
             case _:
                 split.render_nodes.append(node)
+                _emit_nested_imports([node], ctx, split.foreign_defs, split.imports)
     return split
 
 
@@ -598,6 +600,7 @@ def _load_base_nodes(
     for child in loaded.tree.body:
         if isinstance(child, nodes.Macro):
             _emit_macro(child, module_defs, base_ctx)
+            _emit_nested_imports(child.body, base_ctx, module_defs, imports)
         elif isinstance(child, nodes.Extends):
             top_level.extend(_load_base_nodes(child, base_ctx, module_defs, imports))
         elif isinstance(child, nodes.Import):
@@ -606,6 +609,7 @@ def _load_base_nodes(
             _emit_from_import(child, base_ctx, module_defs, imports)
         elif not isinstance(child, nodes.Block):
             top_level.append(child)
+            _emit_nested_imports([child], base_ctx, module_defs, imports)
     return top_level
 
 
@@ -696,6 +700,40 @@ def _load_template(reference: nodes.Node, ctx: _Emit) -> _LoadedTemplate | None:
     except TemplateSyntaxError:
         return None
     return _LoadedTemplate(source=source, tree=tree, seen=ctx.seen | {path.resolve()})
+
+
+def _emit_nested_imports(
+    roots: list[nodes.Node],
+    ctx: _Emit,
+    module_defs: list[Line],
+    imports: list[str],
+) -> None:
+    """Bind macros imported from inside a block, branch, or macro.
+
+    ``_split_top_level`` only emits an ``{% import %}`` or ``{% from %}`` that is a direct
+    child of the template. Anywhere else the body walker has no case for the tag, so it
+    emits the call and drops the binding, and the checker reports the alias as undefined.
+    """
+    for root in roots:
+        _emit_imports_under(root, ctx, module_defs, imports)
+
+
+def _emit_imports_under(
+    node: nodes.Node,
+    ctx: _Emit,
+    module_defs: list[Line],
+    imports: list[str],
+) -> None:
+    defs: list[Line] = []
+    match node:
+        case nodes.Import():
+            _emit_import(node, ctx, defs, imports)
+            module_defs.extend(_mark_foreign(defs, node.lineno))
+        case nodes.FromImport():
+            _emit_from_import(node, ctx, defs, imports)
+            module_defs.extend(_mark_foreign(defs, node.lineno))
+    for child in node.iter_child_nodes():
+        _emit_imports_under(child, ctx, module_defs, imports)
 
 
 def _emit_from_import(
