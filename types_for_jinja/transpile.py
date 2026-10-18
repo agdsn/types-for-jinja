@@ -554,8 +554,9 @@ def _emit_call_block(node: nodes.CallBlock, out: list[Line], indent: int, ctx: _
     inner: list[Line] = []
     with _scoped(_BOUND.get() | bound):
         _emit_body(node.body, inner, indent + 1, ctx)
-    if not inner:
-        inner.append(Line(indent + 1, 'pass', node.lineno))
+    # Sidecar lines share this list but are not indented into the function.
+    if not inner or inner[0].indent <= indent:
+        inner.insert(0, Line(indent + 1, 'pass', node.lineno))
     out.extend(inner)
     try:
         invocation = _with_caller(call, fname)
