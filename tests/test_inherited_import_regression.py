@@ -9,7 +9,7 @@ from types_for_jinja.layout import layout
 from types_for_jinja.transpile import transpile
 
 from .backends import STUB_DIR
-from .checked import reported, write_template
+from .checked import DEFAULT_BACKEND, Reported, reported, write_template
 from .configuration import requires_checker
 
 
@@ -25,6 +25,16 @@ from .configuration import requires_checker
             '{% from "macros.html" import link with context %}',
             '{{ link("hello") }}',
             'def link(',
+        ),
+        (
+            '{% if true %}{% import "macros.html" as navigation %}{{ navigation.link("hello") }}{% endif %}',
+            '',
+            'navigation = _TJNS_navigation',
+        ),
+        (
+            '{% macro show(text) %}{% import "macros.html" as navigation %}{{ navigation.link(text) }}{% endmacro %}',
+            '{{ show("hello") }}',
+            'navigation = _TJNS_navigation',
         ),
     ],
 )
@@ -54,6 +64,124 @@ def test_inherited_macro_import(
     generated = transpile(source, header, template_path=child)
 
     assert expected in generated.code
+
+
+_IMPORT_SCOPES = [
+    (
+        dedent("""\
+            {% import "lib.html" as ns %}
+            {{ ns.f(x) }}
+            """),
+        'ns = _TJNS_ns',
+    ),
+    (
+        dedent("""\
+            {% block body %}
+            {% import "lib.html" as ns %}
+            {{ ns.f(x) }}
+            {% endblock %}
+            """),
+        'ns = _TJNS_ns',
+    ),
+    (
+        dedent("""\
+            {% if x %}
+            {% import "lib.html" as ns %}
+            {{ ns.f(x) }}
+            {% endif %}
+            """),
+        'ns = _TJNS_ns',
+    ),
+    (
+        dedent("""\
+            {% macro g(x) %}
+            {% import "lib.html" as ns %}
+            {{ ns.f(x) }}
+            {% endmacro %}
+            {{ g(x) }}
+            """),
+        'ns = _TJNS_ns',
+    ),
+    (
+        dedent("""\
+            {% extends "base.html" %}
+            {% block body %}
+            {% import "lib.html" as ns %}
+            {{ ns.f(x) }}
+            {% endblock %}
+            """),
+        'ns = _TJNS_ns',
+    ),
+    (
+        dedent("""\
+            {% block body %}
+            {% from "lib.html" import f %}
+            {{ f(x) }}
+            {% endblock %}
+            """),
+        'def f(',
+    ),
+]
+
+
+@pytest.mark.parametrize(('body', 'binding'), _IMPORT_SCOPES)
+def test_imported_macro_is_bound_in_any_scope(tmp_path: Path, body: str, binding: str):
+    """``{% import %}`` and ``{% from %}`` bind their names inside a block, branch, or macro.
+
+    A direct child of the template already became a class or a def. Nested, the stub kept
+    only the call and the checker reported the alias as undefined.
+    """
+    (tmp_path / 'lib.html').write_text('{% macro f(value) %}{{ value }}{% endmacro %}\n')
+    (tmp_path / 'base.html').write_text('{% block body %}{% endblock %}\n')
+    source = '{#def\nx: str\n#}\n' + body
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+    header = parse_header(source)
+    assert header is not None
+
+    generated = transpile(source, header, template_path=page)
+
+    assert generated.code.count(binding) == 1
+    assert 'f(' in generated.code
+
+
+_MACRO = """{% macro f(value) %}
+{#def
+value: str
+#}
+{{ value }}
+{% endmacro %}
+"""
+
+_CALL = """{#def
+x: str
+#}
+{% block body %}
+{% import "lib.html" as ns %}
+{{ ns.f(x) }}
+{% endblock %}
+"""
+
+
+def _check_import(project: Path, call: str) -> list[Reported]:
+    (project / 'templates' / 'lib.html').write_text(_MACRO)
+    template = write_template('templates/page.html', _CALL.replace('ns.f(x)', call))
+    return reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR))
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_import_inside_a_block_typechecks(project: Path):
+    assert _check_import(project, 'ns.f(x)') == []
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_import_inside_a_block_still_checks_the_argument(project: Path):
+    """A bad argument is a type error on the call."""
+    found = _check_import(project, 'ns.f(1)')
+
+    assert found
+    assert {entry.line for entry in found} == {6}
+    assert not any(entry.mentions('not defined') for entry in found)
 
 
 @pytest.mark.parametrize('set_first', [False, True])
