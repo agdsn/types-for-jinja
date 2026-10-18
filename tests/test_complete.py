@@ -70,6 +70,16 @@ def test_macro_parameters_are_visible_in_the_macro_body():
     assert 'card' in outside
 
 
+def test_caller_is_visible_inside_the_macro_body():
+    source = '{#def\nx: int\n#}\n{% macro card() %}\n{#def\ncaller()\n#}\n{{ caller() }}\n{% endmacro %}\n'
+    header = parse_header(source)
+    assert header is not None
+
+    inside = {entry.name for entry in context_names(source, header, line=8)}
+
+    assert 'caller' in inside
+
+
 def test_describe_includes_the_declared_type():
     assert describe(_names(9)['user']) == 'user: User (parameter)'
 
