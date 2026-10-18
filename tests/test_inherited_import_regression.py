@@ -184,6 +184,60 @@ def test_import_inside_a_block_still_checks_the_argument(project: Path):
     assert not any(entry.mentions('not defined') for entry in found)
 
 
+_LIB = """{% macro f(value) %}
+{#def
+value: str
+#}
+{{ value }}
+{% endmacro %}
+"""
+
+_INCLUDED_IMPORTS = [
+    '{% import "lib.html" as ns %}\n{{ ns.f(x) }}\n',
+    '{% macro g(value) %}{% import "lib.html" as ns %}{{ ns.f(value) }}{% endmacro %}\n{{ g(x) }}\n',
+    '{#def\nx: str\n#}\n{% import "lib.html" as ns %}\n{{ ns.f(x) }}\n',
+]
+
+
+@pytest.mark.parametrize('included', _INCLUDED_IMPORTS)
+def test_include_binds_an_import_from_the_included_template(tmp_path: Path, included: str):
+    """``{% include %}`` copies the other template's body, so its ``{% import %}`` has to bind too."""
+    (tmp_path / 'lib.html').write_text(_LIB)
+    (tmp_path / 'a1.html').write_text(included)
+    source = '{#def\nx: str\n#}\n{% include "a1.html" %}\n'
+    page = tmp_path / 'a.html'
+    page.write_text(source)
+    header = parse_header(source)
+    assert header is not None
+
+    generated = transpile(source, header, template_path=page)
+
+    assert generated.code.count('ns = _TJNS_ns') == 1
+    assert 'ns.f(' in generated.code
+
+
+def _check_include(project: Path, call: str) -> list[Reported]:
+    (project / 'templates' / 'lib.html').write_text(_LIB)
+    (project / 'templates' / 'a1.html').write_text(f'{{% import "lib.html" as ns %}}\n{{{{ {call} }}}}\n')
+    template = write_template('templates/a.html', '{#def\nx: str\n#}\n{% include "a1.html" %}\n')
+    return reported(template, Config(template_dirs=['templates'], out_dir=STUB_DIR))
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_include_of_an_import_typechecks(project: Path):
+    assert _check_include(project, 'ns.f(x)') == []
+
+
+@requires_checker(DEFAULT_BACKEND)
+def test_include_of_an_import_still_checks_the_argument(project: Path):
+    """A bad argument is a type error on the include, where the other file's lines are reported."""
+    found = _check_include(project, 'ns.f(1)')
+
+    assert found
+    assert {entry.line for entry in found} == {4}
+    assert not any(entry.mentions('not defined') for entry in found)
+
+
 @pytest.mark.parametrize('set_first', [False, True])
 def test_child_assignment_visible_to_parent(tmp_path: Path, *, set_first: bool):
     """Top-level `{% set %}`s should be visible to a parent template, on either side of extends."""
