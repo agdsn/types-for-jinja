@@ -78,6 +78,10 @@ class _Emit:
     # Imports from a template pulled in by ``{% include %}``. They have to stay outside
     # ``_render``: layout dedents the render body, which would pull a namespace class apart.
     included_imports: list[Line] = field(default_factory=list)
+    # Template text for the file being emitted. ``{% endcall %}`` is not on the AST.
+    source: str = ''
+    # Callee name, ``{% from %}`` alias, or ``ns.macro``, to the clause that types the call block.
+    caller_clauses: dict[str, CallerClause] = field(default_factory=dict)
 
 
 def macro_defs(
@@ -201,6 +205,7 @@ def transpile(
         syntax=config.syntax,
         seen=frozenset({template_path.resolve()} if template_path is not None else ()),
         ambient=ambient,
+        source=source,
     )
     # Set before ``_split_top_level``: loading a base template emits its macros immediately.
     token = _BOUND.set(ambient | _bindings_in([tree]))
@@ -466,8 +471,7 @@ def _emit_node(node: nodes.Node, out: list[Line], indent: int, ctx: _Emit) -> No
         case nodes.With():
             _emit_with(node, out, indent, ctx)
         case nodes.CallBlock():
-            _emit_expr_check(node.call, out, indent)
-            _emit_body(node.body, out, indent, ctx)
+            _emit_call_block(node, out, indent, ctx)
         case nodes.Include():
             _emit_include(node, out, indent, ctx)
         case nodes.Macro():
@@ -533,6 +537,133 @@ def _emit_with(node: nodes.With, out: list[Line], indent: int, ctx: _Emit) -> No
             rendered = 'None'
         out.append(Line(indent, f'{name} = {rendered}', node.lineno))
     _emit_body(node.body, out, indent, ctx)
+
+
+def _emit_call_block(node: nodes.CallBlock, out: list[Line], indent: int, ctx: _Emit) -> None:
+    """Emit the call block as a nested function passed to the callee's ``caller`` parameter.
+
+    The function is on the ``{% call %}`` line and the invocation is on ``{% endcall %}``,
+    so a bad argument is reported on the tag that performs the call.
+    """
+    call = node.call
+    fname = f'_tj_caller_{node.lineno}'
+    params = _call_block_params(node.args, _clause_for_callee(call, ctx))
+    out.append(Line(indent, f'def {fname}({params}) -> {_ANY}:', node.lineno))
+    bound = frozenset(name for arg in node.args for name in _stored_names(arg))
+    inner: list[Line] = []
+    with _scoped(_BOUND.get() | bound):
+        _emit_body(node.body, inner, indent + 1, ctx)
+    if not inner:
+        inner.append(Line(indent + 1, 'pass', node.lineno))
+    out.extend(inner)
+    try:
+        invocation = _with_caller(call, fname)
+    except UnsupportedTemplateError:
+        _emit_fallback_names(call, out, indent)
+        return
+    out.append(Line(indent, f'_ = {invocation}', _endcall_line(ctx.source, node.lineno, ctx.syntax)))
+
+
+def _call_block_params(args: Iterable[nodes.Node], clause: CallerClause | None) -> str:
+    """Zip call-block arguments with the callee's caller slots, leaving unknown slots untyped."""
+    rendered: list[str] = []
+    for index, arg in enumerate(args):
+        if not isinstance(arg, nodes.Name):
+            continue
+        name = _ident(arg.name)
+        if clause is not None and index < len(clause.params):
+            rendered.append(f'{name}: {clause.params[index].annotation or _ANY}')
+        else:
+            rendered.append(name)
+    return ', '.join(rendered)
+
+
+def _clause_for_callee(call: nodes.Call, ctx: _Emit) -> CallerClause | None:
+    key = callee_key(call)
+    if key is None:
+        return None
+    return ctx.caller_clauses.get(key)
+
+
+def callee_key(call: nodes.Node) -> str | None:
+    """Local macro name, ``{% from %}`` alias, or ``ns.macro`` from ``{% import as %}``."""
+    if not isinstance(call, nodes.Call):
+        return None
+    target = call.node
+    if isinstance(target, nodes.Name):
+        return target.name
+    if isinstance(target, nodes.Getattr) and isinstance(target.node, nodes.Name):
+        return f'{target.node.name}.{target.attr}'
+    return None
+
+
+def _remember_caller(ctx: _Emit, key: str, clause: CallerClause | None) -> None:
+    if clause is not None:
+        ctx.caller_clauses[key] = clause
+
+
+def _with_caller(call: nodes.Call, fname: str) -> str:
+    rendered = _call(call)
+    head, sep, _tail = rendered.rpartition(')')
+    if not sep:
+        return f'{rendered}(caller={fname})'
+    joiner = '' if head.endswith('(') else ', '
+    return f'{head}{joiner}caller={fname})'
+
+
+def _endcall_line(source: str, call_line: int, syntax: Syntax) -> int:
+    """Line of the ``endcall`` that closes the call block at ``call_line``.
+
+    Jinja records no node for a closing tag, so the line is scanned from the source.
+    """
+    opener = syntax.block_start_string
+    closer = syntax.block_end_string
+    if not opener or not closer:
+        return call_line
+    depth = 0
+    pos = _line_offset(source, call_line)
+    while True:
+        opened = source.find(opener, pos)
+        if opened < 0:
+            return call_line
+        closed = source.find(closer, opened + len(opener))
+        if closed < 0:
+            return call_line
+        name = _block_name(source[opened + len(opener) : closed])
+        if name == 'call':
+            depth += 1
+        elif name == 'endcall' and depth:
+            depth -= 1
+            if depth == 0:
+                return source.count('\n', 0, opened) + 1
+        pos = closed + len(closer)
+
+
+def _line_offset(source: str, line: int) -> int:
+    if line <= 1:
+        return 0
+    offset = 0
+    seen = 1
+    while seen < line:
+        found = source.find('\n', offset)
+        if found < 0:
+            return len(source)
+        offset = found + 1
+        seen += 1
+    return offset
+
+
+def _block_name(inner: str) -> str:
+    text = inner.lstrip()
+    if text.startswith('-'):
+        text = text[1:].lstrip()
+    name: list[str] = []
+    for char in text:
+        if char == '_' or char.isalnum():
+            name.append(char)
+        else:
+            break
+    return ''.join(name)
 
 
 def _macro_params(node: nodes.Macro, macro_types: MacroTypes, caller: CallerClause | None) -> str:
@@ -601,6 +732,7 @@ def _emit_macro(
 ) -> None:
     name = alias or node.name
     caller = ctx.macro_callers.get(node.lineno)
+    _remember_caller(ctx, name, caller)
     signature = _macro_params(node, ctx.macro_types, caller)
     out.append(Line(indent, f'def {name}({signature}) -> _TJAny:', node.lineno))
     inner: list[Line] = []
@@ -672,7 +804,13 @@ def _load_base_nodes(
         return []
     base_types, base_callers, base_imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     imports.extend(base_imports)
-    base_ctx = replace(ctx, macro_types=base_types, macro_callers=base_callers, seen=loaded.seen)
+    base_ctx = replace(
+        ctx,
+        macro_types=base_types,
+        macro_callers=base_callers,
+        seen=loaded.seen,
+        source=loaded.source,
+    )
     top_level: list[nodes.Node] = []
     for child in loaded.tree.body:
         if isinstance(child, nodes.Macro):
@@ -715,7 +853,7 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     # Caller clauses are keyed by line number inside one template. Keeping the parent's
     # map would attach its clause to an included macro that starts on the same line.
     _, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
-    include_ctx = replace(ctx, macro_callers=callers, seen=loaded.seen)
+    include_ctx = replace(ctx, macro_callers=callers, seen=loaded.seen, source=loaded.source)
     # +1 on every indent here: this content still has to pass through the same "inside
     # def _render(...):" unwrap every other emitted line does before it reaches the sidecar
     # (see _unwrap_render), so it has to start one level deep like everything else, not at
@@ -751,7 +889,7 @@ def _emit_untyped_include(
     types, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     body = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
     inner: list[Line] = []
-    included = replace(ctx, macro_types=types, macro_callers=callers, seen=loaded.seen)
+    included = replace(ctx, macro_types=types, macro_callers=callers, seen=loaded.seen, source=loaded.source)
     _emit_included_imports(body, included, node.lineno)
     # An untyped include is inlined into the caller's scope, plus the names it binds itself.
     with _scoped(_BOUND.get() | _bindings_in(body)):
@@ -853,6 +991,7 @@ def _emit_from_import(
                 replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers),
                 alias=alias,
             )
+            _remember_caller(ctx, alias, loaded.callers.get(macro.lineno))
 
 
 def _emit_import(
@@ -872,6 +1011,7 @@ def _emit_import(
     for macro in loaded.macros.values():
         module_defs.append(Line(1, '@staticmethod', macro.lineno))
         _emit_macro_stub(macro, module_defs, 1, replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers))
+        _remember_caller(ctx, f'{node.target}.{macro.name}', loaded.callers.get(macro.lineno))
     module_defs.append(Line(0, f'{node.target} = {cls}', node.lineno))
 
 

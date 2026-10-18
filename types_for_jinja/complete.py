@@ -2,7 +2,7 @@
 
 The header declares parameters, ``[tool.types_for_jinja]`` declares Environment globals,
 and the template itself binds more names through ``{% for %}``, ``{% set %}``,
-``{% with %}``, ``{% macro %}``, and ``{% import %}``. This module walks the Jinja AST
+``{% with %}``, ``{% macro %}``, ``{% call %}``, and ``{% import %}``. This module walks the Jinja AST
 and reports which of those are visible on a given line, so the LSP can offer them as
 completions and describe them on hover.
 """
@@ -18,12 +18,13 @@ from jinja2 import TemplateSyntaxError, nodes
 
 from types_for_jinja import filters
 from types_for_jinja.config import Config, Syntax
-from types_for_jinja.header import TemplateHeader
+from types_for_jinja.header import CallerClause, TemplateHeader
 from types_for_jinja.transpile import (
     Line,
     MacroCallers,
     MacroTypes,
     build_environment,
+    callee_key,
     deepest_line,
     macro_defs,
     transpile,
@@ -121,7 +122,8 @@ def context_names(
     tree = _parse_tolerantly(source, line, config.syntax, config.extensions)
     if tree is not None:
         macro_types, callers, _ = macro_defs(source, tree, config.syntax)
-        _scan(tree.body, line, source.count('\n') + 1, found, macro_types, callers=callers)
+        clauses = {macro.name: callers[macro.lineno] for macro in tree.find_all(nodes.Macro) if macro.lineno in callers}
+        _scan(tree.body, line, source.count('\n') + 1, found, macro_types, callers=callers, clauses=clauses)
     return sorted(_deduplicate(found), key=lambda entry: entry.name)
 
 
@@ -270,14 +272,15 @@ def _scan(
     types: MacroTypes,
     *,
     callers: MacroCallers,
+    clauses: dict[str, CallerClause],
 ) -> None:
     for node, node_end in _spans(body, end):
         if node.lineno > line:
             return
         contains = line <= node_end
-        out.extend(_bindings(node, types, callers=callers, contains=contains))
+        out.extend(_bindings(node, types, callers=callers, clauses=clauses, contains=contains))
         if contains:
-            _descend(node, line, node_end, out, types, callers=callers)
+            _descend(node, line, node_end, out, types, callers=callers, clauses=clauses)
 
 
 def _bindings(  # ruff:ignore[too-many-return-statements]
@@ -285,6 +288,7 @@ def _bindings(  # ruff:ignore[too-many-return-statements]
     types: MacroTypes,
     *,
     callers: MacroCallers,
+    clauses: dict[str, CallerClause],
     contains: bool,
 ) -> list[ContextName]:
     """Names ``node`` itself introduces; ``contains`` means the cursor is inside its body."""
@@ -313,6 +317,8 @@ def _bindings(  # ruff:ignore[too-many-return-statements]
                 ContextName(entry[1] if isinstance(entry, tuple) else entry, '', 'imported macro')
                 for entry in node.names
             ]
+        case nodes.CallBlock() if contains:
+            return _call_arguments(node, clauses)
         case _:
             return []
 
@@ -325,19 +331,32 @@ def _descend(
     types: MacroTypes,
     *,
     callers: MacroCallers,
+    clauses: dict[str, CallerClause],
 ) -> None:
     """Recurse into the child bodies of a node that encloses the cursor."""
     match node:
         case nodes.If():
             for branch in [node.body, *(elif_node.body for elif_node in node.elif_), node.else_]:
-                _scan(branch, line, end, out, types, callers=callers)
+                _scan(branch, line, end, out, types, callers=callers, clauses=clauses)
         case nodes.For():
-            _scan(node.body, line, end, out, types, callers=callers)
-            _scan(node.else_, line, end, out, types, callers=callers)
+            _scan(node.body, line, end, out, types, callers=callers, clauses=clauses)
+            _scan(node.else_, line, end, out, types, callers=callers, clauses=clauses)
         case nodes.Block() | nodes.Scope() | nodes.FilterBlock() | nodes.CallBlock() | nodes.Macro() | nodes.With():
-            _scan(node.body, line, end, out, types, callers=callers)
+            _scan(node.body, line, end, out, types, callers=callers, clauses=clauses)
         case _:
             return
+
+
+def _call_arguments(node: nodes.CallBlock, clauses: dict[str, CallerClause]) -> list[ContextName]:
+    """Names the call block binds, typed from the callee's caller clause when it is known."""
+    clause = clauses.get(callee_key(node.call) or '')
+    found: list[ContextName] = []
+    for index, arg in enumerate(node.args):
+        type_str = ''
+        if clause is not None and index < len(clause.params):
+            type_str = clause.params[index].annotation or 'Any'
+        found.extend(ContextName(name, type_str, 'call block argument') for name in _target_names(arg))
+    return found
 
 
 def _target_names(target: nodes.Node) -> list[str]:
