@@ -124,6 +124,26 @@ _CALL_WRAP = """{% call wrap(x) %}
 
 _BARE_WRAP = '{{ wrap(x) }}\n'
 
+_EARLIER_CALLS_LATER = """{#def
+from examples.models import User
+users: list[User]
+#}
+{% macro earlier() %}
+{% call(person) later(users) %}
+{{ person.naem }}
+{% endcall %}
+{% endmacro %}
+{% macro later(users) %}
+{#def
+from examples.models import User
+users: list[User]
+caller(user: User)
+#}
+{{ caller(user) }}
+{% endmacro %}
+{{ earlier() }}
+"""
+
 
 def _checked(text: str) -> list[checked.Reported]:
     """Write the macro template into the current project and report what the checker says."""
@@ -192,3 +212,8 @@ def test_a_call_block_passes_caller_and_a_plain_call_does_not(examples_project):
     """``{% call %}`` supplies the required caller. A plain call leaves it missing."""
     assert _checked(_WRAP + _CALL_WRAP) == []
     assert any(entry.mentions('caller') for entry in _checked(_WRAP + _BARE_WRAP))
+
+
+def test_a_call_block_that_targets_a_later_macro_reports_a_typo(examples_project):
+    """``person`` is the ``User`` from ``later``, which is defined after the call."""
+    assert any(entry.mentions('naem') for entry in _checked(_EARLIER_CALLS_LATER))
