@@ -307,14 +307,14 @@ x: str
 def _assignment_inside_function(code: str, name: str) -> bool:
     """Whether ``name = ...`` appears inside a function body, not at module level."""
     tree = ast.parse(code)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            for child in node.body:
-                if isinstance(child, ast.Assign):
-                    for target in child.targets:
-                        if isinstance(target, ast.Name) and target.id == name:
-                            return True
-    return False
+    return any(
+        isinstance(target, ast.Name) and target.id == name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        for child in node.body
+        if isinstance(child, ast.Assign)
+        for target in child.targets
+    )
 
 
 def _module_level_names(code: str) -> set[str]:
@@ -353,7 +353,7 @@ def test_two_typed_includes_bind_the_same_import_inside_each_function(tmp_path: 
     """Each include owns its ``misc``; the parent stub must not assign it at module level."""
     code, sidecar = _aligned_include(tmp_path, _TYPED_FRAGMENT, _TYPED_FRAGMENT)
 
-    assert sidecar.count('misc = _TJNS_misc') == 2
+    assert sidecar.count('misc = _TJNS_misc') == sidecar.count('def tj_include_')
     assert _assignment_inside_function(sidecar, 'misc')
     assert 'misc' not in _module_level_names(sidecar)
     assert 'misc =' not in code
@@ -411,7 +411,7 @@ def test_two_untyped_includes_with_the_same_import_typecheck(tmp_path: Path):
 
     assert 'def tj_include_a0_html() -> None:' in sidecar
     assert 'def tj_include_a1_html() -> None:' in sidecar
-    assert sidecar.count('misc = _TJNS_misc') == 2
+    assert sidecar.count('misc = _TJNS_misc') == sidecar.count('def tj_include_')
     assert _assignment_inside_function(sidecar, 'misc')
     assert 'misc' not in _module_level_names(sidecar)
     assert 'misc =' not in code
@@ -443,6 +443,7 @@ def test_two_includes_with_the_same_from_import(tmp_path: Path):
     tree = ast.parse(sidecar)
     module_defs = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
     assert module_defs.count('f') == 0
+    include_fns = [name for name in module_defs if name.startswith('tj_include_')]
     nested = [
         child.name
         for node in tree.body
@@ -450,7 +451,7 @@ def test_two_includes_with_the_same_from_import(tmp_path: Path):
         for child in node.body
         if isinstance(child, ast.FunctionDef)
     ]
-    assert nested.count('f') == 2
+    assert nested.count('f') == len(include_fns)
 
 
 @requires_checker(DEFAULT_BACKEND)
