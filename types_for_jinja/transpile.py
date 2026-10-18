@@ -297,6 +297,7 @@ class _TopLevel:
 
 
 def _split_top_level(tree: nodes.Template, ctx: _Emit) -> _TopLevel:
+    _register_local_callers(tree, ctx)
     split = _TopLevel()
     for node in tree.body:
         match node:
@@ -602,6 +603,16 @@ def _remember_caller(ctx: _Emit, key: str, clause: CallerClause | None) -> None:
         ctx.caller_clauses[key] = clause
 
 
+def _register_local_callers(root: nodes.Node, ctx: _Emit) -> None:
+    """Record each macro in ``root`` before any of those bodies emit.
+
+    A macro with no caller clause stays unset, so a ``{% from %}`` alias or
+    ``ns.macro`` of the same name keeps the clause already recorded for it.
+    """
+    for macro in root.find_all(nodes.Macro):
+        _remember_caller(ctx, macro.name, ctx.macro_callers.get(macro.lineno))
+
+
 def _with_caller(call: nodes.Call, fname: str) -> str:
     rendered = _call(call)
     head, sep, _tail = rendered.rpartition(')')
@@ -811,6 +822,7 @@ def _load_base_nodes(
         seen=loaded.seen,
         source=loaded.source,
     )
+    _register_local_callers(loaded.tree, base_ctx)
     top_level: list[nodes.Node] = []
     for child in loaded.tree.body:
         if isinstance(child, nodes.Macro):
@@ -868,6 +880,7 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
         inner: list[Line] = [Line(2, imp, node.lineno) for imp in filter_imports(loaded.tree, depth=0)]
         top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
         _emit_included_imports(top_level, include_ctx, node.lineno)
+        _register_local_callers(loaded.tree, include_ctx)
         _emit_body(top_level, inner, 2, include_ctx)
     if not inner:
         inner.append(Line(2, 'pass', node.lineno))
@@ -891,6 +904,7 @@ def _emit_untyped_include(
     inner: list[Line] = []
     included = replace(ctx, macro_types=types, macro_callers=callers, seen=loaded.seen, source=loaded.source)
     _emit_included_imports(body, included, node.lineno)
+    _register_local_callers(loaded.tree, included)
     # An untyped include is inlined into the caller's scope, plus the names it binds itself.
     with _scoped(_BOUND.get() | _bindings_in(body)):
         _emit_body(body, inner, indent, included)
