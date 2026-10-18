@@ -151,6 +151,35 @@ def test_caller_is_undefined_makes_the_parameter_optional():
     assert '*, caller: _TJCallable[[], _TJAny] | None = None' in _signature(code, 'card')
 
 
+def test_a_nested_defined_test_leaves_the_outer_caller_required():
+    code = _code(
+        '{#def x: int #}\n'
+        '{% macro outer() %}\n'
+        '{#def\ncaller()\n#}\n'
+        '{% macro inner() %}\n'
+        '{% if caller is defined %}x{% endif %}\n'
+        '{% endmacro %}\n'
+        '{{ caller() }}\n'
+        '{% endmacro %}\n'
+    )
+
+    signature = _signature(code, 'outer')
+    assert 'def outer(*, caller: _TJCallable[[], _TJAny]) -> _TJAny:' in signature
+    assert '| None' not in signature
+
+
+def test_include_copies_the_caller_clause(tmp_path):
+    (tmp_path / 'lib.html').write_text(
+        '{#def\ny: int\n#}\n{% macro wrap() %}\n{#def\ncaller(user: User)\n#}\n{{ caller(user) }}\n{% endmacro %}\n'
+    )
+    source = '{#def x: int #}\n{% include "lib.html" %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+    code = _code(source, page)
+
+    assert 'def wrap(*, caller: _TJCallable[[User], _TJAny])' in code
+
+
 def test_from_import_copies_the_caller_clause(tmp_path):
     code = _imported(tmp_path, '{% from "lib.html" import wrap %}')
 
