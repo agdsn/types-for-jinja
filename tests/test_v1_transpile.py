@@ -196,3 +196,16 @@ def test_import_copies_the_caller_clause(tmp_path):
     assert '*, caller: _TJCallable[[User], _TJAny]) -> _TJAny:' in signature
     assert signature.startswith('    def wrap(')
     assert 'from collections.abc import Callable as _TJCallable' in code
+
+
+def test_a_call_whose_include_emits_no_suite_parses(tmp_path):
+    """A typed include's sidecar lines sit outside the caller function, which still needs a suite."""
+    (tmp_path / 'inc.html').write_text('{#def y: int #}\n{{ y }}\n')
+    source = '{#def x: str #}\n{% call tabpane() %}{% include "inc.html" %}{% endcall %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+
+    code = _code(source, page)
+
+    ast.parse(code)
+    assert 'def tj_include_inc_html(' in code
