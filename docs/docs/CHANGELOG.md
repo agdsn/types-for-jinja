@@ -1,42 +1,11 @@
 ## Unreleased
 
-### Fix
-
-- **transpile**: Emit pass for an empty for-else body
-- **deps**: bump gitpython to 3.1.61
-- lock pkl for the platforms CI installs on
-
-## 1.1.3 (2026-08-16)
-
-### Fix
-
-- **generate**: skip a template whose header cannot be read
-
-## 1.1.2 (2026-08-16)
-
-### Fix
-
-- **header**: accept a defaulted declaration before an undefaulted one
-
-## 1.1.1 (2026-08-12)
-
-### Fix
-
-- **wrapper**: emit a valid signature for a header with no parameters
-- **cli**: count the manifest in the wrapper write total
-- **wrapper**: prune the wrappers whose templates are gone
-- convert Path to PurePosixPath via as_posix on Windows (#1)
-
-## 1.1.0 (2026-08-05)
-
 ### Feat
 
+- pass a call block as the caller argument
+- give macro stubs a keyword-only caller
+- parse a caller clause out of a macro header
 - **transpile**: check a typed {% include %} as a parameterized call
-
-## 1.0.0 (2026-08-04)
-
-### Feat
-
 - **emit**: mangle templated directory names so Copier and Cookiecutter check
 - **cli**: broaden template discovery and default to template_dirs
 - **transpile**: check templates that use namespace() and Jinja's globals
@@ -70,6 +39,27 @@
 
 ### Fix
 
+- scope included imports to each include
+- give a nested typed include a suite
+- give an empty call block a suite
+- resolve a caller clause before macro bodies emit
+- keep each caller clause on its own macro
+- scan caller clauses with python tokens
+- **transpile**: emit imports from included files in includee as well
+- **transpile**: emit imports nested in other directives as well
+- make default filter work via tracking of defined names
+- emit child-exported assignments before parent-render
+- **transpile**: emit imports to extends blocks
+- **transpile**: support line-less nodes
+- **transpile**: Emit pass for an empty for-else body
+- **deps**: bump gitpython to 3.1.61
+- lock pkl for the platforms CI installs on
+- **generate**: skip a template whose header cannot be read
+- **header**: accept a defaulted declaration before an undefaulted one
+- **wrapper**: emit a valid signature for a header with no parameters
+- **cli**: count the manifest in the wrapper write total
+- **wrapper**: prune the wrappers whose templates are gone
+- convert Path to PurePosixPath via as_posix on Windows (#1)
 - **generate**: make stub-to-stub imports resolve without a search path
 - **lsp**: prepare the checker cache on first use, not on import
 - restore the collapsed {#def #} headers and stop them silently breaking
