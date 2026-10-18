@@ -19,7 +19,15 @@ from jinja2 import TemplateSyntaxError, nodes
 from types_for_jinja import filters
 from types_for_jinja.config import Config, Syntax
 from types_for_jinja.header import TemplateHeader
-from types_for_jinja.transpile import Line, MacroTypes, build_environment, deepest_line, macro_defs, transpile
+from types_for_jinja.transpile import (
+    Line,
+    MacroCallers,
+    MacroTypes,
+    build_environment,
+    deepest_line,
+    macro_defs,
+    transpile,
+)
 
 _IDENT_RUN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*$')
 _WORD_AT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
@@ -112,8 +120,8 @@ def context_names(
     found.extend(ContextName(name, type_str, 'global') for name, type_str in config.globals if name not in param_names)
     tree = _parse_tolerantly(source, line, config.syntax, config.extensions)
     if tree is not None:
-        macro_types, _ = macro_defs(source, tree, config.syntax)
-        _scan(tree.body, line, source.count('\n') + 1, found, macro_types)
+        macro_types, callers, _ = macro_defs(source, tree, config.syntax)
+        _scan(tree.body, line, source.count('\n') + 1, found, macro_types, callers=callers)
     return sorted(_deduplicate(found), key=lambda entry: entry.name)
 
 
@@ -254,17 +262,31 @@ def _spans(body: list[nodes.Node], end: int) -> list[tuple[nodes.Node, int]]:
     return spans
 
 
-def _scan(body: list[nodes.Node], line: int, end: int, out: list[ContextName], types: MacroTypes) -> None:
+def _scan(
+    body: list[nodes.Node],
+    line: int,
+    end: int,
+    out: list[ContextName],
+    types: MacroTypes,
+    *,
+    callers: MacroCallers,
+) -> None:
     for node, node_end in _spans(body, end):
         if node.lineno > line:
             return
         contains = line <= node_end
-        out.extend(_bindings(node, types, contains=contains))
+        out.extend(_bindings(node, types, callers=callers, contains=contains))
         if contains:
-            _descend(node, line, node_end, out, types)
+            _descend(node, line, node_end, out, types, callers=callers)
 
 
-def _bindings(node: nodes.Node, types: MacroTypes, *, contains: bool) -> list[ContextName]:  # ruff:ignore[too-many-return-statements]
+def _bindings(  # ruff:ignore[too-many-return-statements]
+    node: nodes.Node,
+    types: MacroTypes,
+    *,
+    callers: MacroCallers,
+    contains: bool,
+) -> list[ContextName]:
     """Names ``node`` itself introduces; ``contains`` means the cursor is inside its body."""
     match node:
         case nodes.For() if contains:
@@ -279,6 +301,8 @@ def _bindings(node: nodes.Node, types: MacroTypes, *, contains: bool) -> list[Co
                 if contains
                 else []
             )
+            if contains and node.lineno in callers:
+                params.append(ContextName('caller', '', 'caller'))
             return [ContextName(node.name, '', 'macro'), *params]
         case nodes.Assign() | nodes.AssignBlock():
             return [ContextName(name, '', 'set') for name in _target_names(node.target)]
@@ -293,17 +317,25 @@ def _bindings(node: nodes.Node, types: MacroTypes, *, contains: bool) -> list[Co
             return []
 
 
-def _descend(node: nodes.Node, line: int, end: int, out: list[ContextName], types: MacroTypes) -> None:
+def _descend(
+    node: nodes.Node,
+    line: int,
+    end: int,
+    out: list[ContextName],
+    types: MacroTypes,
+    *,
+    callers: MacroCallers,
+) -> None:
     """Recurse into the child bodies of a node that encloses the cursor."""
     match node:
         case nodes.If():
             for branch in [node.body, *(elif_node.body for elif_node in node.elif_), node.else_]:
-                _scan(branch, line, end, out, types)
+                _scan(branch, line, end, out, types, callers=callers)
         case nodes.For():
-            _scan(node.body, line, end, out, types)
-            _scan(node.else_, line, end, out, types)
+            _scan(node.body, line, end, out, types, callers=callers)
+            _scan(node.else_, line, end, out, types, callers=callers)
         case nodes.Block() | nodes.Scope() | nodes.FilterBlock() | nodes.CallBlock() | nodes.Macro() | nodes.With():
-            _scan(node.body, line, end, out, types)
+            _scan(node.body, line, end, out, types, callers=callers)
         case _:
             return
 

@@ -20,7 +20,7 @@ from jinja2 import Environment, TemplateSyntaxError, nodes
 from types_for_jinja import components, filters
 from types_for_jinja.config import EXTENSIONS, Config, Syntax
 from types_for_jinja.emit import flat_name, relative_module
-from types_for_jinja.header import TemplateHeader, header_errors, parse_defs, parse_header
+from types_for_jinja.header import CallerClause, TemplateHeader, header_errors, parse_defs, parse_header
 from types_for_jinja.resolve import resolve_template, search_paths
 
 _CMP_OPS = {
@@ -41,6 +41,12 @@ _ANY = '_TJAny'
 _DEFAULT_FILTERS = frozenset({'default', 'd'})
 """Filters that accept a missing value instead of raising, ``StrictUndefined`` included."""
 
+_CALLABLE_IMPORT = 'from collections.abc import Callable as _TJCallable'
+"""Preamble import for a stub that types a macro's ``caller`` parameter."""
+
+_DEFINEDNESS = frozenset({'defined', 'undefined'})
+"""Jinja tests that ask whether ``caller`` was passed by a call block."""
+
 _BOUND: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar('_tj_bound_names', default=frozenset())
 
 JINJA_GLOBALS = ('cycler', 'joiner', 'lipsum', 'namespace')
@@ -53,12 +59,16 @@ under ``[tool.types_for_jinja]`` is not fighting a duplicate binding.
 MacroTypes = dict[int, dict[str, str]]
 """Declared parameter types for each ``{% macro %}``, keyed by the macro's line number."""
 
+MacroCallers = dict[int, CallerClause]
+"""The ``caller(...)`` clause of each macro that declares one, keyed by the macro's line number."""
+
 
 @dataclass(frozen=True)
 class _Emit:
     """What the emitters need beyond the node itself: declared types and how to reach other files."""
 
     macro_types: MacroTypes
+    macro_callers: MacroCallers
     search_dirs: list[Path]
     env: Environment
     syntax: Syntax
@@ -70,15 +80,18 @@ class _Emit:
     included_imports: list[Line] = field(default_factory=list)
 
 
-def macro_defs(source: str, tree: nodes.Template, syntax: Syntax | None = None) -> tuple[MacroTypes, list[str]]:
+def macro_defs(
+    source: str, tree: nodes.Template, syntax: Syntax | None = None
+) -> tuple[MacroTypes, MacroCallers, list[str]]:
     """Bind each ``{#def #}`` block inside a macro body to that macro.
 
     A block belongs to the closest macro that starts at or before it and still encloses
     it, so a macro nested in another macro claims its own block. Returns the per-macro
-    parameter types and the imports those blocks declare.
+    parameter types, each macro's ``caller(...)`` clause, and the imports those blocks declare.
     """
     macros = sorted(tree.find_all(nodes.Macro), key=lambda node: node.lineno)
     types: MacroTypes = {}
+    callers: MacroCallers = {}
     imports: list[str] = []
     for block in parse_defs(source, syntax):
         owner = next(
@@ -92,8 +105,10 @@ def macro_defs(source: str, tree: nodes.Template, syntax: Syntax | None = None) 
         if owner is None:
             continue
         types[owner.lineno] = {param.name: param.annotation or _ANY for param in block.params}
+        if block.caller is not None:
+            callers[owner.lineno] = block.caller
         imports.extend(block.imports)
-    return types, imports
+    return types, callers, imports
 
 
 def build_environment(syntax: Syntax, extensions: list[str] | None = None) -> Environment:
@@ -176,10 +191,11 @@ def transpile(
     config = config or Config()
     env = build_environment(config.syntax, config.extensions)
     tree = env.parse(source)
-    macro_types, macro_imports = macro_defs(source, tree, config.syntax)
+    macro_types, macro_callers, macro_imports = macro_defs(source, tree, config.syntax)
     ambient = _ambient_names(tree, header, config)
     ctx = _Emit(
         macro_types=macro_types,
+        macro_callers=macro_callers,
         search_dirs=_search_dirs(template_path, config),
         env=env,
         syntax=config.syntax,
@@ -253,6 +269,7 @@ def _emit_module(
     if not body:
         body.append(Line(1, 'pass', header.lineno))
     lines.extend(body)
+    preamble_len = _declare_callable(lines, preamble_len, header.lineno)
     code = '\n'.join(_render_line(line) for line in lines) + '\n'
     return GeneratedModule(
         code=code,
@@ -340,6 +357,17 @@ def _preamble(
         if name not in param_names and name not in declared_globals
     )
     return lines
+
+
+def _declare_callable(lines: list[Line], preamble_len: int, lineno: int) -> int:
+    """Import ``_TJCallable`` when a macro stub in ``lines`` names it, and nowhere else."""
+    if not any('_TJCallable' in line.text for line in lines):
+        return preamble_len
+    at = next(
+        index for index, line in enumerate(lines[:preamble_len]) if line.text == 'from typing import Any as _TJAny'
+    )
+    lines.insert(at, Line(0, _CALLABLE_IMPORT, lineno))
+    return preamble_len + 1
 
 
 def _extension_globals(config: Config) -> list[str]:
@@ -507,17 +535,43 @@ def _emit_with(node: nodes.With, out: list[Line], indent: int, ctx: _Emit) -> No
     _emit_body(node.body, out, indent, ctx)
 
 
-def _macro_params(node: nodes.Macro, macro_types: MacroTypes) -> str:
+def _macro_params(node: nodes.Macro, macro_types: MacroTypes, caller: CallerClause | None) -> str:
     """Render the macro's parameter list, annotated from its own ``{#def #}`` block.
 
     An undeclared parameter stays unannotated so the checker infers it rather than
-    reporting every use of it.
+    reporting every use of it. A ``caller(...)`` clause becomes a keyword-only parameter
+    after those arguments. It is optional only when the body tests whether ``caller`` was passed.
     """
     declared = macro_types.get(node.lineno, {})
     offset = len(node.args) - len(node.defaults)
-    return ', '.join(
+    rendered = ', '.join(
         _macro_param(_ident(arg.name), declared.get(arg.name), defaulted=index >= offset)
         for index, arg in enumerate(node.args)
+    )
+    if caller is None:
+        return rendered
+    slot = _caller_parameter(caller, optional=_caller_is_optional(node))
+    return f'{rendered}, {slot}' if rendered else slot
+
+
+def _caller_parameter(clause: CallerClause, *, optional: bool) -> str:
+    """The keyword-only ``caller`` parameter a macro stub declares for ``clause``."""
+    slots = ', '.join(param.annotation or _ANY for param in clause.params)
+    returns = clause.returns or _ANY
+    annotation = f'_TJCallable[[{slots}], {returns}]'
+    if optional:
+        annotation += ' | None = None'
+    return f'*, caller: {annotation}'
+
+
+def _caller_is_optional(macro: nodes.Macro) -> bool:
+    """Whether ``macro`` tests ``caller is defined`` or ``caller is undefined``.
+
+    A bare ``caller()`` call is not that test, so it leaves the parameter required.
+    """
+    return any(
+        test.name in _DEFINEDNESS and isinstance(test.node, nodes.Name) and test.node.name == 'caller'
+        for test in macro.find_all(nodes.Test)
     )
 
 
@@ -536,12 +590,16 @@ def _emit_macro(
     alias: str | None = None,
 ) -> None:
     name = alias or node.name
-    signature = _macro_params(node, ctx.macro_types)
+    caller = ctx.macro_callers.get(node.lineno)
+    signature = _macro_params(node, ctx.macro_types, caller)
     out.append(Line(indent, f'def {name}({signature}) -> _TJAny:', node.lineno))
     inner: list[Line] = []
     # A macro's parameters are local to its body, including one loaded from a base template
     # whose names were not part of the caller's scope.
-    with _scoped(_BOUND.get() | {arg.name for arg in node.args}):
+    bound = {arg.name for arg in node.args}
+    if caller is not None:
+        bound.add('caller')
+    with _scoped(_BOUND.get() | bound):
         _emit_body(node.body, inner, indent + 1, ctx)
     if not inner:
         inner.append(Line(indent + 1, 'pass', node.lineno))
@@ -557,7 +615,8 @@ def _emit_macro_stub(
     alias: str | None = None,
 ) -> None:
     name = alias or node.name
-    out.append(Line(indent, f'def {name}({_macro_params(node, ctx.macro_types)}) -> _TJAny: ...', node.lineno))
+    signature = _macro_params(node, ctx.macro_types, ctx.macro_callers.get(node.lineno))
+    out.append(Line(indent, f'def {name}({signature}) -> _TJAny: ...', node.lineno))
 
 
 def _const_str(node: nodes.Node) -> str | None:
@@ -570,6 +629,7 @@ class _ForeignMacros:
 
     macros: dict[str, nodes.Macro]
     types: MacroTypes
+    callers: MacroCallers
     imports: list[str]
 
 
@@ -577,10 +637,11 @@ def _load_macros(template: nodes.Node, ctx: _Emit) -> _ForeignMacros | None:
     loaded = _load_template(template, ctx)
     if loaded is None:
         return None
-    types, imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    types, callers, imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     return _ForeignMacros(
         macros={child.name: child for child in loaded.tree.body if isinstance(child, nodes.Macro)},
         types=types,
+        callers=callers,
         imports=imports,
     )
 
@@ -599,9 +660,9 @@ def _load_base_nodes(
     loaded = _load_template(node.template, ctx)
     if loaded is None:
         return []
-    base_types, base_imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    base_types, base_callers, base_imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     imports.extend(base_imports)
-    base_ctx = replace(ctx, macro_types=base_types, seen=loaded.seen)
+    base_ctx = replace(ctx, macro_types=base_types, macro_callers=base_callers, seen=loaded.seen)
     top_level: list[nodes.Node] = []
     for child in loaded.tree.body:
         if isinstance(child, nodes.Macro):
@@ -674,10 +735,10 @@ def _emit_untyped_include(
     indent: int,
     ctx: _Emit,
 ) -> None:
-    types, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    types, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     body = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
     inner: list[Line] = []
-    included = replace(ctx, macro_types=types, seen=loaded.seen)
+    included = replace(ctx, macro_types=types, macro_callers=callers, seen=loaded.seen)
     _emit_included_imports(body, included, node.lineno)
     # An untyped include is inlined into the caller's scope, plus the names it binds itself.
     with _scoped(_BOUND.get() | _bindings_in(body)):
@@ -772,7 +833,13 @@ def _emit_from_import(
         name, alias = entry if isinstance(entry, tuple) else (entry, entry)
         macro = loaded.macros.get(name)
         if macro is not None:
-            _emit_macro_stub(macro, module_defs, 0, replace(ctx, macro_types=loaded.types), alias=alias)
+            _emit_macro_stub(
+                macro,
+                module_defs,
+                0,
+                replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers),
+                alias=alias,
+            )
 
 
 def _emit_import(
@@ -791,7 +858,7 @@ def _emit_import(
         module_defs.append(Line(1, 'pass', node.lineno))
     for macro in loaded.macros.values():
         module_defs.append(Line(1, '@staticmethod', macro.lineno))
-        _emit_macro_stub(macro, module_defs, 1, replace(ctx, macro_types=loaded.types))
+        _emit_macro_stub(macro, module_defs, 1, replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers))
     module_defs.append(Line(0, f'{node.target} = {cls}', node.lineno))
 
 

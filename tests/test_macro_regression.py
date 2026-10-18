@@ -16,7 +16,7 @@ def test_typed_macro_with_comparison():
         """
     )
     tree = Environment(autoescape=True).parse(source)
-    types, imports = macro_defs(source, tree)
+    types, _, imports = macro_defs(source, tree)
 
     assert list(types.values()) == [{'value': 'int'}]
     assert imports == []
