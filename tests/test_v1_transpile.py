@@ -209,3 +209,17 @@ def test_a_call_whose_include_emits_no_suite_parses(tmp_path):
 
     ast.parse(code)
     assert 'def tj_include_inc_html(' in code
+
+
+def test_a_typed_include_of_a_typed_include_parses(tmp_path):
+    """The outer include function still needs a suite when its body is another include's def."""
+    (tmp_path / 'inner.html').write_text('{#def y: int #}\n{{ y }}\n')
+    (tmp_path / 'outer.html').write_text('{#def y: int #}\n{% include "inner.html" %}\n')
+    source = '{#def x: int #}\n{% include "outer.html" %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+
+    code = _code(source, page)
+
+    ast.parse(code)
+    assert 'def tj_include_outer_html(' in code
