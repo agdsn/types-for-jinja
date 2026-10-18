@@ -6,10 +6,26 @@ from types_for_jinja.header import parse_header
 from types_for_jinja.transpile import transpile
 
 
-def _code(source):
+def _code(source, template_path=None):
     header = parse_header(source)
     assert header is not None
-    return transpile(source, header).code
+    return transpile(source, header, template_path=template_path).code
+
+
+def _signature(code, name):
+    found = [line for line in code.splitlines() if f'def {name}(' in line]
+    assert len(found) == 1
+    return found[0]
+
+
+def _imported(tmp_path, directive):
+    (tmp_path / 'lib.html').write_text(
+        '{% macro wrap() %}\n{#def\ncaller(user: User)\n#}\n{{ caller(user) }}\n{% endmacro %}\n'
+    )
+    source = '{#def x: int #}\n' + directive + '\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+    return _code(source, page)
 
 
 def test_macro_is_modeled_with_params():
@@ -66,3 +82,144 @@ def test_for_else_with_only_literal_text_is_valid_python():
     code = _code('{#def items: list[str] #}\n{% for item in items %}{{ item }}{% else %}text{% endfor %}')
 
     ast.parse(code)
+
+
+def test_an_empty_caller_clause_is_a_keyword_only_parameter():
+    code = _code(
+        '{#def x: int #}\n'
+        '{% macro plain(title) %}{{ title }}{% endmacro %}\n'
+        '{% macro card() %}\n'
+        '{#def\ncaller()\n#}\n'
+        '{{ caller() }}\n'
+        '{% endmacro %}\n'
+    )
+
+    assert '*, caller: _TJCallable[[], _TJAny]) -> _TJAny:' in _signature(code, 'card')
+    assert 'caller' not in _signature(code, 'plain')
+    assert 'from collections.abc import Callable as _TJCallable' in code
+    untouched = _code('{#def x: int #}\n{% macro plain(title) %}{{ title }}{% endmacro %}\n')
+    assert '_TJCallable' not in untouched
+
+
+def test_a_typed_caller_slot_is_a_keyword_only_parameter():
+    code = _code(
+        '{#def x: int #}\n{% macro card() %}\n{#def\ncaller(user: User)\n#}\n{{ caller(user) }}\n{% endmacro %}\n'
+    )
+
+    assert '*, caller: _TJCallable[[User], _TJAny]) -> _TJAny:' in _signature(code, 'card')
+
+
+def test_a_caller_return_annotation_types_the_callable():
+    code = _code(
+        '{#def x: int #}\n'
+        '{% macro card() %}\n'
+        '{#def\ncaller(user: User) -> Markup\n#}\n'
+        '{{ caller(user) }}\n'
+        '{% endmacro %}\n'
+    )
+
+    assert '*, caller: _TJCallable[[User], Markup]) -> _TJAny:' in _signature(code, 'card')
+
+
+def test_a_bare_caller_slot_is_any():
+    code = _code('{#def x: int #}\n{% macro card() %}\n{#def\ncaller(user)\n#}\n{{ caller(user) }}\n{% endmacro %}\n')
+
+    assert '*, caller: _TJCallable[[_TJAny], _TJAny]) -> _TJAny:' in _signature(code, 'card')
+
+
+def test_caller_is_defined_makes_the_parameter_optional():
+    code = _code(
+        '{#def x: int #}\n'
+        '{% macro card() %}\n'
+        '{#def\ncaller()\n#}\n'
+        '{% if caller is defined %}{{ caller() }}{% endif %}\n'
+        '{% endmacro %}\n'
+    )
+
+    assert '*, caller: _TJCallable[[], _TJAny] | None = None' in _signature(code, 'card')
+
+
+def test_caller_is_undefined_makes_the_parameter_optional():
+    code = _code(
+        '{#def x: int #}\n'
+        '{% macro card() %}\n'
+        '{#def\ncaller()\n#}\n'
+        '{% if caller is undefined %}hidden{% endif %}\n'
+        '{% endmacro %}\n'
+    )
+
+    assert '*, caller: _TJCallable[[], _TJAny] | None = None' in _signature(code, 'card')
+
+
+def test_a_nested_defined_test_leaves_the_outer_caller_required():
+    code = _code(
+        '{#def x: int #}\n'
+        '{% macro outer() %}\n'
+        '{#def\ncaller()\n#}\n'
+        '{% macro inner() %}\n'
+        '{% if caller is defined %}x{% endif %}\n'
+        '{% endmacro %}\n'
+        '{{ caller() }}\n'
+        '{% endmacro %}\n'
+    )
+
+    signature = _signature(code, 'outer')
+    assert 'def outer(*, caller: _TJCallable[[], _TJAny]) -> _TJAny:' in signature
+    assert '| None' not in signature
+
+
+def test_include_copies_the_caller_clause(tmp_path):
+    (tmp_path / 'lib.html').write_text(
+        '{#def\ny: int\n#}\n{% macro wrap() %}\n{#def\ncaller(user: User)\n#}\n{{ caller(user) }}\n{% endmacro %}\n'
+    )
+    source = '{#def x: int #}\n{% include "lib.html" %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+    code = _code(source, page)
+
+    assert 'def wrap(*, caller: _TJCallable[[User], _TJAny])' in code
+
+
+def test_from_import_copies_the_caller_clause(tmp_path):
+    code = _imported(tmp_path, '{% from "lib.html" import wrap %}')
+
+    signature = _signature(code, 'wrap')
+    assert '*, caller: _TJCallable[[User], _TJAny]) -> _TJAny:' in signature
+    assert signature.startswith('def wrap(')
+    assert 'from collections.abc import Callable as _TJCallable' in code
+
+
+def test_import_copies_the_caller_clause(tmp_path):
+    code = _imported(tmp_path, '{% import "lib.html" as ns %}')
+
+    signature = _signature(code, 'wrap')
+    assert '*, caller: _TJCallable[[User], _TJAny]) -> _TJAny:' in signature
+    assert signature.startswith('    def wrap(')
+    assert 'from collections.abc import Callable as _TJCallable' in code
+
+
+def test_a_call_whose_include_emits_no_suite_parses(tmp_path):
+    """A typed include's sidecar lines sit outside the caller function, which still needs a suite."""
+    (tmp_path / 'inc.html').write_text('{#def y: int #}\n{{ y }}\n')
+    source = '{#def x: str #}\n{% call tabpane() %}{% include "inc.html" %}{% endcall %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+
+    code = _code(source, page)
+
+    ast.parse(code)
+    assert 'def tj_include_inc_html(' in code
+
+
+def test_a_typed_include_of_a_typed_include_parses(tmp_path):
+    """The outer include function still needs a suite when its body is another include's def."""
+    (tmp_path / 'inner.html').write_text('{#def y: int #}\n{{ y }}\n')
+    (tmp_path / 'outer.html').write_text('{#def y: int #}\n{% include "inner.html" %}\n')
+    source = '{#def x: int #}\n{% include "outer.html" %}\n'
+    page = tmp_path / 'page.html'
+    page.write_text(source)
+
+    code = _code(source, page)
+
+    ast.parse(code)
+    assert 'def tj_include_outer_html(' in code

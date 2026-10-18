@@ -121,3 +121,36 @@ def test_an_unsupported_construct_skips_one_template_not_the_run(tmp_path, monke
 
     assert [reason for path, reason in generated.skipped if path == odd] == ['unsupported template construct: OddNode']
     assert generated.stubs
+
+
+def test_a_multiline_call_block_keeps_an_aligned_stub():
+    """The nested function is on the call tag, and ``caller=`` is on the end tag."""
+    source = (
+        '{#def\n'
+        'from examples.models import User\n'
+        'users: list[User]\n'
+        '#}\n'
+        '{% macro dump_users(users) %}\n'
+        '{#def\n'
+        'from examples.models import User\n'
+        'users: list[User]\n'
+        'caller(user: User)\n'
+        '#}\n'
+        '{% for user in users %}\n'
+        '{{ caller(user) }}\n'
+        '{% endfor %}\n'
+        '{% endmacro %}\n'
+        '{% call(person) dump_users(users) %}\n'
+        '{{ person.name }}\n'
+        '{% endcall %}\n'
+    )
+    aligned = _aligned(source)
+
+    assert aligned is not None
+    ast.parse(aligned.code)
+    lines = aligned.code.splitlines()
+    call_line = source.splitlines().index('{% call(person) dump_users(users) %}')
+    end_line = source.splitlines().index('{% endcall %}')
+    assert 'def ' in lines[call_line]
+    assert 'person' in lines[call_line]
+    assert 'caller=' in lines[end_line]

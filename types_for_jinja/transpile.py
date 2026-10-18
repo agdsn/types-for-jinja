@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import keyword
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -20,7 +20,7 @@ from jinja2 import Environment, TemplateSyntaxError, nodes
 from types_for_jinja import components, filters
 from types_for_jinja.config import EXTENSIONS, Config, Syntax
 from types_for_jinja.emit import flat_name, relative_module
-from types_for_jinja.header import TemplateHeader, header_errors, parse_defs, parse_header
+from types_for_jinja.header import CallerClause, TemplateHeader, header_errors, parse_defs, parse_header
 from types_for_jinja.resolve import resolve_template, search_paths
 
 _CMP_OPS = {
@@ -41,6 +41,12 @@ _ANY = '_TJAny'
 _DEFAULT_FILTERS = frozenset({'default', 'd'})
 """Filters that accept a missing value instead of raising, ``StrictUndefined`` included."""
 
+_CALLABLE_IMPORT = 'from collections.abc import Callable as _TJCallable'
+"""Preamble import for a stub that types a macro's ``caller`` parameter."""
+
+_DEFINEDNESS = frozenset({'defined', 'undefined'})
+"""Jinja tests that ask whether ``caller`` was passed by a call block."""
+
 _BOUND: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar('_tj_bound_names', default=frozenset())
 
 JINJA_GLOBALS = ('cycler', 'joiner', 'lipsum', 'namespace')
@@ -53,12 +59,16 @@ under ``[tool.types_for_jinja]`` is not fighting a duplicate binding.
 MacroTypes = dict[int, dict[str, str]]
 """Declared parameter types for each ``{% macro %}``, keyed by the macro's line number."""
 
+MacroCallers = dict[int, CallerClause]
+"""The ``caller(...)`` clause of each macro that declares one, keyed by the macro's line number."""
+
 
 @dataclass(frozen=True)
 class _Emit:
     """What the emitters need beyond the node itself: declared types and how to reach other files."""
 
     macro_types: MacroTypes
+    macro_callers: MacroCallers
     search_dirs: list[Path]
     env: Environment
     syntax: Syntax
@@ -68,17 +78,24 @@ class _Emit:
     # Imports from a template pulled in by ``{% include %}``. They have to stay outside
     # ``_render``: layout dedents the render body, which would pull a namespace class apart.
     included_imports: list[Line] = field(default_factory=list)
+    # Template text for the file being emitted. ``{% endcall %}`` is not on the AST.
+    source: str = ''
+    # Callee name, ``{% from %}`` alias, or ``ns.macro``, to the clause that types the call block.
+    caller_clauses: dict[str, CallerClause] = field(default_factory=dict)
 
 
-def macro_defs(source: str, tree: nodes.Template, syntax: Syntax | None = None) -> tuple[MacroTypes, list[str]]:
+def macro_defs(
+    source: str, tree: nodes.Template, syntax: Syntax | None = None
+) -> tuple[MacroTypes, MacroCallers, list[str]]:
     """Bind each ``{#def #}`` block inside a macro body to that macro.
 
     A block belongs to the closest macro that starts at or before it and still encloses
     it, so a macro nested in another macro claims its own block. Returns the per-macro
-    parameter types and the imports those blocks declare.
+    parameter types, each macro's ``caller(...)`` clause, and the imports those blocks declare.
     """
     macros = sorted(tree.find_all(nodes.Macro), key=lambda node: node.lineno)
     types: MacroTypes = {}
+    callers: MacroCallers = {}
     imports: list[str] = []
     for block in parse_defs(source, syntax):
         owner = next(
@@ -92,8 +109,10 @@ def macro_defs(source: str, tree: nodes.Template, syntax: Syntax | None = None) 
         if owner is None:
             continue
         types[owner.lineno] = {param.name: param.annotation or _ANY for param in block.params}
+        if block.caller is not None:
+            callers[owner.lineno] = block.caller
         imports.extend(block.imports)
-    return types, imports
+    return types, callers, imports
 
 
 def build_environment(syntax: Syntax, extensions: list[str] | None = None) -> Environment:
@@ -176,15 +195,17 @@ def transpile(
     config = config or Config()
     env = build_environment(config.syntax, config.extensions)
     tree = env.parse(source)
-    macro_types, macro_imports = macro_defs(source, tree, config.syntax)
+    macro_types, macro_callers, macro_imports = macro_defs(source, tree, config.syntax)
     ambient = _ambient_names(tree, header, config)
     ctx = _Emit(
         macro_types=macro_types,
+        macro_callers=macro_callers,
         search_dirs=_search_dirs(template_path, config),
         env=env,
         syntax=config.syntax,
         seen=frozenset({template_path.resolve()} if template_path is not None else ()),
         ambient=ambient,
+        source=source,
     )
     # Set before ``_split_top_level``: loading a base template emits its macros immediately.
     token = _BOUND.set(ambient | _bindings_in([tree]))
@@ -253,6 +274,7 @@ def _emit_module(
     if not body:
         body.append(Line(1, 'pass', header.lineno))
     lines.extend(body)
+    preamble_len = _declare_callable(lines, preamble_len, header.lineno)
     code = '\n'.join(_render_line(line) for line in lines) + '\n'
     return GeneratedModule(
         code=code,
@@ -275,6 +297,7 @@ class _TopLevel:
 
 
 def _split_top_level(tree: nodes.Template, ctx: _Emit) -> _TopLevel:
+    _register_local_callers(tree, ctx)
     split = _TopLevel()
     for node in tree.body:
         match node:
@@ -340,6 +363,17 @@ def _preamble(
         if name not in param_names and name not in declared_globals
     )
     return lines
+
+
+def _declare_callable(lines: list[Line], preamble_len: int, lineno: int) -> int:
+    """Import ``_TJCallable`` when a macro stub in ``lines`` names it, and nowhere else."""
+    if not any('_TJCallable' in line.text for line in lines):
+        return preamble_len
+    at = next(
+        index for index, line in enumerate(lines[:preamble_len]) if line.text == 'from typing import Any as _TJAny'
+    )
+    lines.insert(at, Line(0, _CALLABLE_IMPORT, lineno))
+    return preamble_len + 1
 
 
 def _extension_globals(config: Config) -> list[str]:
@@ -438,8 +472,7 @@ def _emit_node(node: nodes.Node, out: list[Line], indent: int, ctx: _Emit) -> No
         case nodes.With():
             _emit_with(node, out, indent, ctx)
         case nodes.CallBlock():
-            _emit_expr_check(node.call, out, indent)
-            _emit_body(node.body, out, indent, ctx)
+            _emit_call_block(node, out, indent, ctx)
         case nodes.Include():
             _emit_include(node, out, indent, ctx)
         case nodes.Macro():
@@ -507,18 +540,192 @@ def _emit_with(node: nodes.With, out: list[Line], indent: int, ctx: _Emit) -> No
     _emit_body(node.body, out, indent, ctx)
 
 
-def _macro_params(node: nodes.Macro, macro_types: MacroTypes) -> str:
+def _emit_call_block(node: nodes.CallBlock, out: list[Line], indent: int, ctx: _Emit) -> None:
+    """Emit the call block as a nested function passed to the callee's ``caller`` parameter.
+
+    The function is on the ``{% call %}`` line and the invocation is on ``{% endcall %}``,
+    so a bad argument is reported on the tag that performs the call.
+    """
+    call = node.call
+    fname = f'_tj_caller_{node.lineno}'
+    params = _call_block_params(node.args, _clause_for_callee(call, ctx))
+    out.append(Line(indent, f'def {fname}({params}) -> {_ANY}:', node.lineno))
+    bound = frozenset(name for arg in node.args for name in _stored_names(arg))
+    inner: list[Line] = []
+    with _scoped(_BOUND.get() | bound):
+        _emit_body(node.body, inner, indent + 1, ctx)
+    # Sidecar lines share this list but are not indented into the function.
+    if not inner or inner[0].indent <= indent:
+        inner.insert(0, Line(indent + 1, 'pass', node.lineno))
+    out.extend(inner)
+    try:
+        invocation = _with_caller(call, fname)
+    except UnsupportedTemplateError:
+        _emit_fallback_names(call, out, indent)
+        return
+    out.append(Line(indent, f'_ = {invocation}', _endcall_line(ctx.source, node.lineno, ctx.syntax)))
+
+
+def _call_block_params(args: Iterable[nodes.Node], clause: CallerClause | None) -> str:
+    """Zip call-block arguments with the callee's caller slots, leaving unknown slots untyped."""
+    rendered: list[str] = []
+    for index, arg in enumerate(args):
+        if not isinstance(arg, nodes.Name):
+            continue
+        name = _ident(arg.name)
+        if clause is not None and index < len(clause.params):
+            rendered.append(f'{name}: {clause.params[index].annotation or _ANY}')
+        else:
+            rendered.append(name)
+    return ', '.join(rendered)
+
+
+def _clause_for_callee(call: nodes.Call, ctx: _Emit) -> CallerClause | None:
+    key = callee_key(call)
+    if key is None:
+        return None
+    return ctx.caller_clauses.get(key)
+
+
+def callee_key(call: nodes.Node) -> str | None:
+    """Local macro name, ``{% from %}`` alias, or ``ns.macro`` from ``{% import as %}``."""
+    if not isinstance(call, nodes.Call):
+        return None
+    target = call.node
+    if isinstance(target, nodes.Name):
+        return target.name
+    if isinstance(target, nodes.Getattr) and isinstance(target.node, nodes.Name):
+        return f'{target.node.name}.{target.attr}'
+    return None
+
+
+def _remember_caller(ctx: _Emit, key: str, clause: CallerClause | None) -> None:
+    if clause is not None:
+        ctx.caller_clauses[key] = clause
+
+
+def _register_local_callers(root: nodes.Node, ctx: _Emit) -> None:
+    """Record each macro in ``root`` before any of those bodies emit.
+
+    A macro with no caller clause stays unset, so a ``{% from %}`` alias or
+    ``ns.macro`` of the same name keeps the clause already recorded for it.
+    """
+    for macro in root.find_all(nodes.Macro):
+        _remember_caller(ctx, macro.name, ctx.macro_callers.get(macro.lineno))
+
+
+def _with_caller(call: nodes.Call, fname: str) -> str:
+    rendered = _call(call)
+    head, sep, _tail = rendered.rpartition(')')
+    if not sep:
+        return f'{rendered}(caller={fname})'
+    joiner = '' if head.endswith('(') else ', '
+    return f'{head}{joiner}caller={fname})'
+
+
+def _endcall_line(source: str, call_line: int, syntax: Syntax) -> int:
+    """Line of the ``endcall`` that closes the call block at ``call_line``.
+
+    Jinja records no node for a closing tag, so the line is scanned from the source.
+    """
+    opener = syntax.block_start_string
+    closer = syntax.block_end_string
+    if not opener or not closer:
+        return call_line
+    depth = 0
+    pos = _line_offset(source, call_line)
+    while True:
+        opened = source.find(opener, pos)
+        if opened < 0:
+            return call_line
+        closed = source.find(closer, opened + len(opener))
+        if closed < 0:
+            return call_line
+        name = _block_name(source[opened + len(opener) : closed])
+        if name == 'call':
+            depth += 1
+        elif name == 'endcall' and depth:
+            depth -= 1
+            if depth == 0:
+                return source.count('\n', 0, opened) + 1
+        pos = closed + len(closer)
+
+
+def _line_offset(source: str, line: int) -> int:
+    if line <= 1:
+        return 0
+    offset = 0
+    seen = 1
+    while seen < line:
+        found = source.find('\n', offset)
+        if found < 0:
+            return len(source)
+        offset = found + 1
+        seen += 1
+    return offset
+
+
+def _block_name(inner: str) -> str:
+    text = inner.lstrip()
+    if text.startswith('-'):
+        text = text[1:].lstrip()
+    name: list[str] = []
+    for char in text:
+        if char == '_' or char.isalnum():
+            name.append(char)
+        else:
+            break
+    return ''.join(name)
+
+
+def _macro_params(node: nodes.Macro, macro_types: MacroTypes, caller: CallerClause | None) -> str:
     """Render the macro's parameter list, annotated from its own ``{#def #}`` block.
 
     An undeclared parameter stays unannotated so the checker infers it rather than
-    reporting every use of it.
+    reporting every use of it. A ``caller(...)`` clause becomes a keyword-only parameter
+    after those arguments. It is optional only when the body tests whether ``caller`` was passed.
     """
     declared = macro_types.get(node.lineno, {})
     offset = len(node.args) - len(node.defaults)
-    return ', '.join(
+    rendered = ', '.join(
         _macro_param(_ident(arg.name), declared.get(arg.name), defaulted=index >= offset)
         for index, arg in enumerate(node.args)
     )
+    if caller is None:
+        return rendered
+    slot = _caller_parameter(caller, optional=_caller_is_optional(node))
+    return f'{rendered}, {slot}' if rendered else slot
+
+
+def _caller_parameter(clause: CallerClause, *, optional: bool) -> str:
+    """The keyword-only ``caller`` parameter a macro stub declares for ``clause``."""
+    slots = ', '.join(param.annotation or _ANY for param in clause.params)
+    returns = clause.returns or _ANY
+    annotation = f'_TJCallable[[{slots}], {returns}]'
+    if optional:
+        annotation += ' | None = None'
+    return f'*, caller: {annotation}'
+
+
+def _caller_is_optional(macro: nodes.Macro) -> bool:
+    """Whether this macro's own body tests ``caller is defined`` or ``caller is undefined``.
+
+    A bare ``caller()`` call is not that test, so it leaves the parameter required.
+    A nested macro is a separate body, so its test does not make this caller optional.
+    """
+    return any(
+        test.name in _DEFINEDNESS and isinstance(test.node, nodes.Name) and test.node.name == 'caller'
+        for test in _own_tests(macro.body)
+    )
+
+
+def _own_tests(body: Iterable[nodes.Node]) -> Iterator[nodes.Test]:
+    for node in body:
+        if isinstance(node, nodes.Macro):
+            continue
+        if isinstance(node, nodes.Test):
+            yield node
+        yield from _own_tests(node.iter_child_nodes())
 
 
 def _macro_param(name: str, type_str: str | None, *, defaulted: bool) -> str:
@@ -536,12 +743,17 @@ def _emit_macro(
     alias: str | None = None,
 ) -> None:
     name = alias or node.name
-    signature = _macro_params(node, ctx.macro_types)
+    caller = ctx.macro_callers.get(node.lineno)
+    _remember_caller(ctx, name, caller)
+    signature = _macro_params(node, ctx.macro_types, caller)
     out.append(Line(indent, f'def {name}({signature}) -> _TJAny:', node.lineno))
     inner: list[Line] = []
     # A macro's parameters are local to its body, including one loaded from a base template
     # whose names were not part of the caller's scope.
-    with _scoped(_BOUND.get() | {arg.name for arg in node.args}):
+    bound = {arg.name for arg in node.args}
+    if caller is not None:
+        bound.add('caller')
+    with _scoped(_BOUND.get() | bound):
         _emit_body(node.body, inner, indent + 1, ctx)
     if not inner:
         inner.append(Line(indent + 1, 'pass', node.lineno))
@@ -557,7 +769,8 @@ def _emit_macro_stub(
     alias: str | None = None,
 ) -> None:
     name = alias or node.name
-    out.append(Line(indent, f'def {name}({_macro_params(node, ctx.macro_types)}) -> _TJAny: ...', node.lineno))
+    signature = _macro_params(node, ctx.macro_types, ctx.macro_callers.get(node.lineno))
+    out.append(Line(indent, f'def {name}({signature}) -> _TJAny: ...', node.lineno))
 
 
 def _const_str(node: nodes.Node) -> str | None:
@@ -570,6 +783,7 @@ class _ForeignMacros:
 
     macros: dict[str, nodes.Macro]
     types: MacroTypes
+    callers: MacroCallers
     imports: list[str]
 
 
@@ -577,10 +791,11 @@ def _load_macros(template: nodes.Node, ctx: _Emit) -> _ForeignMacros | None:
     loaded = _load_template(template, ctx)
     if loaded is None:
         return None
-    types, imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    types, callers, imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     return _ForeignMacros(
         macros={child.name: child for child in loaded.tree.body if isinstance(child, nodes.Macro)},
         types=types,
+        callers=callers,
         imports=imports,
     )
 
@@ -599,9 +814,16 @@ def _load_base_nodes(
     loaded = _load_template(node.template, ctx)
     if loaded is None:
         return []
-    base_types, base_imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    base_types, base_callers, base_imports = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     imports.extend(base_imports)
-    base_ctx = replace(ctx, macro_types=base_types, seen=loaded.seen)
+    base_ctx = replace(
+        ctx,
+        macro_types=base_types,
+        macro_callers=base_callers,
+        seen=loaded.seen,
+        source=loaded.source,
+    )
+    _register_local_callers(loaded.tree, base_ctx)
     top_level: list[nodes.Node] = []
     for child in loaded.tree.body:
         if isinstance(child, nodes.Macro):
@@ -641,7 +863,10 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
     # skips underscore-prefixed names, so a `_tj_`-style name here would never be visible
     # at the call site below.
     name = f'tj_include_{flat_name(Path(_const_str(node.template) or "include"))}'
-    include_ctx = replace(ctx, seen=loaded.seen)
+    # Caller clauses are keyed by line number inside one template. Keeping the parent's
+    # map would attach its clause to an included macro that starts on the same line.
+    _, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    include_ctx = replace(ctx, macro_callers=callers, seen=loaded.seen, source=loaded.source)
     # +1 on every indent here: this content still has to pass through the same "inside
     # def _render(...):" unwrap every other emitted line does before it reaches the sidecar
     # (see _unwrap_render), so it has to start one level deep like everything else, not at
@@ -656,9 +881,12 @@ def _emit_include(node: nodes.Include, out: list[Line], indent: int, ctx: _Emit)
         inner: list[Line] = [Line(2, imp, node.lineno) for imp in filter_imports(loaded.tree, depth=0)]
         top_level = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
         _emit_included_imports(top_level, include_ctx, node.lineno)
+        _register_local_callers(loaded.tree, include_ctx)
         _emit_body(top_level, inner, 2, include_ctx)
-    if not inner:
-        inner.append(Line(2, 'pass', node.lineno))
+    # A nested typed include emits its own def at this function's indent, which ends the
+    # suite before any indented statement. `pass` keeps the function a valid suite.
+    if not inner or inner[0].indent <= 1:
+        inner.insert(0, Line(2, 'pass', node.lineno))
     body.extend(inner)
     out.extend(_mark_foreign(body, node.lineno))
     # A bare call, not `_ = ...`: the function is declared `-> None`, and mypy's
@@ -674,11 +902,12 @@ def _emit_untyped_include(
     indent: int,
     ctx: _Emit,
 ) -> None:
-    types, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
+    types, callers, _ = macro_defs(loaded.source, loaded.tree, ctx.syntax)
     body = [child for child in loaded.tree.body if not isinstance(child, nodes.Extends)]
     inner: list[Line] = []
-    included = replace(ctx, macro_types=types, seen=loaded.seen)
+    included = replace(ctx, macro_types=types, macro_callers=callers, seen=loaded.seen, source=loaded.source)
     _emit_included_imports(body, included, node.lineno)
+    _register_local_callers(loaded.tree, included)
     # An untyped include is inlined into the caller's scope, plus the names it binds itself.
     with _scoped(_BOUND.get() | _bindings_in(body)):
         _emit_body(body, inner, indent, included)
@@ -772,7 +1001,14 @@ def _emit_from_import(
         name, alias = entry if isinstance(entry, tuple) else (entry, entry)
         macro = loaded.macros.get(name)
         if macro is not None:
-            _emit_macro_stub(macro, module_defs, 0, replace(ctx, macro_types=loaded.types), alias=alias)
+            _emit_macro_stub(
+                macro,
+                module_defs,
+                0,
+                replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers),
+                alias=alias,
+            )
+            _remember_caller(ctx, alias, loaded.callers.get(macro.lineno))
 
 
 def _emit_import(
@@ -791,7 +1027,8 @@ def _emit_import(
         module_defs.append(Line(1, 'pass', node.lineno))
     for macro in loaded.macros.values():
         module_defs.append(Line(1, '@staticmethod', macro.lineno))
-        _emit_macro_stub(macro, module_defs, 1, replace(ctx, macro_types=loaded.types))
+        _emit_macro_stub(macro, module_defs, 1, replace(ctx, macro_types=loaded.types, macro_callers=loaded.callers))
+        _remember_caller(ctx, f'{node.target}.{macro.name}', loaded.callers.get(macro.lineno))
     module_defs.append(Line(0, f'{node.target} = {cls}', node.lineno))
 
 

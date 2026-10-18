@@ -117,3 +117,183 @@ def test_an_untyped_name_reports_no_annotation_rather_than_guessing():
     assert header.params == [Param('action')]
     assert header.params[0].annotated('_TJAny') == 'action: _TJAny'
     assert header.params[0].annotated('Any') == 'action: Any'
+
+
+def test_a_caller_clause_is_separate_from_macro_parameters():
+    """Jinja's call block is not a macro argument, so the caller clause is absent from header.params."""
+    source = '{% macro card() %}\n{#def\nuser: User\ncaller()\n#}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == [Param('user', 'User')]
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[], returns=None)
+
+
+def test_a_caller_clause_declares_slot_parameters():
+    """With no arrow, the clause records no return annotation."""
+    source = '{% macro card() %}\n{#def\ncaller(user: User)\n#}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == []
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[Param('user', 'User')], returns=None)
+
+
+def test_a_caller_clause_keeps_its_return_annotation():
+    """The text after the arrow is the clause's return annotation."""
+    source = '{% macro card() %}\n{#def\ncaller(user: User) -> Markup\n#}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == []
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[Param('user', 'User')], returns='Markup')
+
+
+def test_a_one_line_macro_header_keeps_parameters_beside_the_caller_clause():
+    """A one-line header still leaves the other declarations on the parameter list."""
+    source = '{% macro listing() %}\n{#def users: list[User], caller(user: User) #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == [Param('users', 'list[User]')]
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[Param('user', 'User')], returns=None)
+
+
+def test_a_comma_inside_a_caller_slot_type_stays_in_the_annotation():
+    """The clause has its own parameter list, and dict[str, int] is one annotation in it."""
+    source = '{% macro card() %}\n{#def\ncaller(user: dict[str, int])\n#}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == []
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[Param('user', 'dict[str, int]')], returns=None)
+
+
+def test_two_caller_clauses_are_a_malformed_header():
+    """A macro has one caller clause, so a second one is a header error that names caller."""
+    source = '{% macro card() %}\n{#def\ncaller()\ncaller(user: User)\n#}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+    message = header_errors(header)[0]
+
+    assert 'caller' in message
+    assert 'not a valid parameter list' not in message
+    assert header.caller is None
+
+
+def test_a_caller_clause_on_the_template_header_is_rejected():
+    """Only a macro has a caller clause, so the template's own header reports one as an error."""
+    header = parse_header('{#def\nuser: User\ncaller(item: Item)\n#}\n')
+
+    assert header is not None
+    message = header_errors(header)[0]
+    assert 'caller' in message
+    assert 'not a valid parameter list' not in message
+    assert header.caller is None
+
+
+def test_a_parameter_named_caller_is_not_the_clause():
+    """Written as a declaration, caller is an ordinary Jinja argument and header.caller is None."""
+    header = parse_header('{#def caller: str #}\n')
+
+    assert header is not None
+    assert header.params == [Param('caller', 'str')]
+    assert header_errors(header) == []
+    assert header.caller is None
+
+
+def test_a_macro_parameter_named_caller_is_not_the_clause():
+    """Inside a macro, a declaration named caller is an ordinary argument. The clause is written as caller(...)."""
+    source = '{% macro card() %}\n{#def caller: str #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == [Param('caller', 'str')]
+    assert header_errors(header) == []
+    assert header.caller is None
+
+
+def test_a_caller_clause_and_a_parameter_named_caller_are_malformed():
+    """An argument named caller and a caller() clause in one block make a header error that names caller."""
+    source = '{% macro card() %}\n{#def\ncaller: str\ncaller()\n#}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+    message = header_errors(header)[0]
+
+    assert 'caller' in message
+    assert 'not a valid parameter list' not in message
+    assert header.caller is None
+
+
+def test_an_escaped_triple_quote_keeps_the_separator_before_a_caller_clause():
+    """The escaped quote stays in the default, so the comma after the string separates a real caller clause.
+
+    A template header reports that clause and keeps the parameter.
+    """
+    header = parse_header('{#def name: str = """hello\\"""", caller(user: User) #}\n')
+
+    assert header is not None
+    assert header.params == [Param('name', 'str', "'hello\"'")]
+    assert header.caller is None
+    message = header_errors(header)[0]
+    assert 'a caller clause belongs on a macro' in message
+    assert 'not a valid parameter list' not in message
+
+
+def test_a_macro_reads_the_caller_after_an_escaped_triple_quote():
+    """Inside a macro, that same comma is the caller clause and the default stays on the parameter."""
+    source = '{% macro card() %}\n{#def name: str = """hello\\"""", caller(user: User) #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header.params == [Param('name', 'str', "'hello\"'")]
+    assert header_errors(header) == []
+    from types_for_jinja.header import CallerClause  # ruff:ignore[import-outside-top-level]
+
+    assert header.caller == CallerClause(params=[Param('user', 'User')], returns=None)
+
+
+def test_text_inside_a_triple_quoted_default_is_not_a_caller_clause():
+    """caller(user: User) inside the default is text, so the header has one parameter and no clause."""
+    header = parse_header('{#def name: str = """a\\""", caller(user: User)""" #}\n')
+
+    assert header is not None
+    assert header_errors(header) == []
+    assert header.params == [Param('name', 'str', '\'a""", caller(user: User)\'')]
+    assert header.caller is None
+
+
+def test_a_macro_leaves_caller_text_inside_a_triple_quoted_default():
+    """Inside a macro, that same default is still one parameter and header.caller stays unset."""
+    source = '{% macro card() %}\n{#def name: str = """a\\""", caller(user: User)""" #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header_errors(header) == []
+    assert header.params == [Param('name', 'str', '\'a""", caller(user: User)\'')]
+    assert header.caller is None
+
+
+def test_a_nested_fstring_quote_is_not_a_caller_clause():
+    """A 3.12 f-string may reuse its quote inside the braces, and that text is not a caller clause."""
+    header = parse_header('{#def label: str = f"{d["a, caller(user: User)"]}" #}\n')
+
+    assert header is not None
+    assert header_errors(header) == []
+    assert header.params == [Param('label', 'str', 'f"{d[\'a, caller(user: User)\']}"')]
+    assert header.caller is None
+
+
+def test_a_macro_leaves_caller_text_inside_a_nested_fstring_quote():
+    """Inside a macro, the nested quote stays in the default and header.caller stays unset."""
+    source = '{% macro card() %}\n{#def label: str = f"{d["a, caller(user: User)"]}" #}\n{% endmacro %}\n'
+    header = parse_defs(source)[0]
+
+    assert header_errors(header) == []
+    assert header.params == [Param('label', 'str', 'f"{d[\'a, caller(user: User)\']}"')]
+    assert header.caller is None

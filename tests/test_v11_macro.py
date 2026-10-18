@@ -1,6 +1,5 @@
 """Macro body and macro-call checking."""
 
-
 from types_for_jinja.config import Config
 
 from . import checked
@@ -77,6 +76,74 @@ title: str
 {{ card(title) }}
 """
 
+_DUMP_USERS = """{#def
+from examples.models import User
+users: list[User]
+#}
+{% macro dump_users(users) %}
+{#def
+from examples.models import User
+users: list[User]
+caller(user: User)
+#}
+{% for user in users %}
+{{ caller(user) }}
+{% endfor %}
+{% endmacro %}
+"""
+
+_CALL_PERSON_NAME = """{% call(person) dump_users(users) %}
+{{ person.name }}
+{% endcall %}
+"""
+
+_CALL_PERSON_NAEM = _CALL_PERSON_NAME.replace('person.name', 'person.naem')
+
+_CALL_NO_ARGS = """{% call() dump_users(users) %}
+{% endcall %}
+"""
+
+_CALLER_INT = _DUMP_USERS.replace('{{ caller(user) }}', '{{ caller(123) }}')
+
+_WRAP = """{#def
+x: str
+#}
+{% macro wrap(value) %}
+{#def
+value: str
+caller()
+#}
+{{ caller() }}
+{% endmacro %}
+"""
+
+_CALL_WRAP = """{% call wrap(x) %}
+{{ x }}
+{% endcall %}
+"""
+
+_BARE_WRAP = '{{ wrap(x) }}\n'
+
+_EARLIER_CALLS_LATER = """{#def
+from examples.models import User
+users: list[User]
+#}
+{% macro earlier() %}
+{% call(person) later(users) %}
+{{ person.naem }}
+{% endcall %}
+{% endmacro %}
+{% macro later(users) %}
+{#def
+from examples.models import User
+users: list[User]
+caller(user: User)
+#}
+{{ caller(user) }}
+{% endmacro %}
+{{ earlier() }}
+"""
+
 
 def _checked(text: str) -> list[checked.Reported]:
     """Write the macro template into the current project and report what the checker says."""
@@ -115,3 +182,38 @@ def test_declared_macro_param_with_a_default_stays_typed(examples_project):
 def test_undeclared_macro_params_still_check_the_body(examples_project):
     """Without a macro {#def #} block nothing regresses; the params are simply untyped."""
     assert _checked(_OK) == []
+
+
+def test_caller_rejects_an_argument_the_clause_does_not_accept(examples_project):
+    """``caller(123)`` disagrees with ``caller(user: User)``. A matching call block adds no further error."""
+    source = _CALLER_INT + _CALL_PERSON_NAME
+    caller_line = source.splitlines().index('{{ caller(123) }}') + 1
+
+    assert [entry.line for entry in _checked(source)] == [caller_line]
+
+
+def test_a_matching_call_block_and_caller_argument_are_clean(examples_project):
+    """``caller(user)`` matches the clause, and ``person`` takes that slot by position."""
+    assert _checked(_DUMP_USERS + _CALL_PERSON_NAME) == []
+
+
+def test_a_call_block_with_no_arguments_is_not_a_user_slot(examples_project):
+    """``{% call() %}`` is a function of no arguments, which is not ``caller(user: User)``."""
+    found = _checked(_DUMP_USERS + _CALL_NO_ARGS)
+
+    assert any(entry.mentions('User') for entry in found)
+
+
+def test_a_call_block_attribute_typo_is_an_error(examples_project):
+    assert any(entry.mentions('naem') for entry in _checked(_DUMP_USERS + _CALL_PERSON_NAEM))
+
+
+def test_a_call_block_passes_caller_and_a_plain_call_does_not(examples_project):
+    """``{% call %}`` supplies the required caller. A plain call leaves it missing."""
+    assert _checked(_WRAP + _CALL_WRAP) == []
+    assert any(entry.mentions('caller') for entry in _checked(_WRAP + _BARE_WRAP))
+
+
+def test_a_call_block_that_targets_a_later_macro_reports_a_typo(examples_project):
+    """``person`` is the ``User`` from ``later``, which is defined after the call."""
+    assert any(entry.mentions('naem') for entry in _checked(_EARLIER_CALLS_LATER))
